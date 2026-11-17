@@ -1,16 +1,25 @@
 /**
- * Cloudflare Worker - Self-Hosted URL Shortener
+ * Cloudflare Worker - jethro.au account and URL shortener
  *
  * Features:
  * - Short URL redirects: /s/{code}[/path][?query] → full URL, with extra
  *   path appended and query merged (request params override target params)
  * - Full CRUD API with Bearer token authentication
  * - Soft delete + restore + permanent delete
- * - Self-service API keys: /signup mints a create-scoped key via Google/GitHub OAuth
+ * - jethro.au accounts: /signup mints one create-scoped key per signed-in
+ *   identity (Google/GitHub OAuth or email magic link); one key serves an
+ *   installation for every jethro.au service
+ * - Per-service consent (SERVICES): an organisation agrees to each service's
+ *   data handling separately, at signup or later through /consent. Create keys
+ *   without an accepted consent are refused by /api/shorten and by
+ *   /api/authorize, which other jethro.au Workers call over a service binding
+ * - The URL shortener's privacy page at /url-shortener/privacy (privacy.js)
  *
  * Deploy: cf deploy
  * Companion article: https://www.iamdevbox.com/posts/building-self-hosted-url-shortener-cloudflare-workers/
  */
+
+import { privacyPage } from './privacy.js';
 
 // KV namespace binding: URL_MAPPINGS
 // Configure in cloudflare.config.ts
@@ -37,12 +46,12 @@ export default {
       return handleShortUrl(request, url, env);
     }
 
-    // API: Create short URL (authenticated — admin or create)
+    // API: Create short URL (admin, or create key with url-shortener consent)
     if (url.pathname === '/api/shorten' && request.method === 'POST') {
       return handleCreateShortUrl(request, env);
     }
 
-    // API: Key management (admin only)
+    // API: Key management (admin only, except /mine)
     if (url.pathname === '/api/keys' && request.method === 'GET') {
       return handleListKeys(request, env);
     }
@@ -52,6 +61,10 @@ export default {
     if (url.pathname === '/api/keys/mine' && request.method === 'DELETE') {
       return handleDeleteOwnKey(request, env);
     }
+    const keyConsentMatch = url.pathname.match(/^\/api\/keys\/([^/]+)\/consents\/([^/]+)$/);
+    if (keyConsentMatch && request.method === 'PUT') {
+      return handleAdminPutConsent(request, env, keyConsentMatch[1], keyConsentMatch[2]);
+    }
     if (url.pathname.match(/^\/api\/keys\/([^/]+)$/) && request.method === 'DELETE') {
       return handleDeleteKey(request, url, env);
     }
@@ -59,6 +72,18 @@ export default {
     // API: Validate the current API key (authenticated)
     if (url.pathname === '/api/validate' && request.method === 'GET') {
       return handleValidateKey(request, env);
+    }
+
+    // API: per-service authorization and consent (see SERVICES)
+    if (url.pathname === '/api/authorize' && request.method === 'GET') {
+      return handleAuthorize(request, url, env);
+    }
+    if (url.pathname === '/api/consents' && request.method === 'POST') {
+      return handleCreateConsentTicket(request, url, env);
+    }
+    const consentMatch = url.pathname.match(/^\/api\/consents\/([^/]+)$/);
+    if (consentMatch && request.method === 'DELETE') {
+      return handleWithdrawConsent(request, env, consentMatch[1]);
     }
 
     // API: List all active URLs (admin only)
@@ -93,13 +118,14 @@ export default {
 
     // Landing page
     if (url.pathname === '/' && request.method === 'GET') {
-      return htmlResponse(`<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="utf-8"><title>jethro.au</title></head>
-<body>
-  <p>jethro.au hosts web services for use by any installation of the Jethro church management system. Currently it runs a <a href="https://github.com/jethro-chms/jethro-url-shortener">URL shortener</a>, with signup initiated in Jethro's System Configuration page. For more info, contact <a href="mailto:support@easyjethro.com.au">support@easyjethro.com.au</a>.</p>
-</body>
-</html>`);
+      return htmlResponse(landingPage(env));
+    }
+
+    // The URL shortener's privacy page; its date is the service's policyVersion.
+    if (url.pathname === SERVICES['url-shortener'].privacyPath && (request.method === 'GET' || request.method === 'HEAD')) {
+      return new Response(privacyPage(env, SERVICES['url-shortener'].policyVersion), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=3600' },
+      });
     }
 
     // Self-service signup: OAuth login → mint a create-scoped API key
@@ -115,9 +141,14 @@ export default {
       }
     }
 
-    // Self-service signup: email magic-link flow
-    if (url.pathname === '/signup' && request.method === 'POST') {
-      return handleEmailSignup(request, url, env);
+    // Consent to a service for an existing key (ticket from POST /api/consents)
+    if (url.pathname === '/consent' && request.method === 'GET') {
+      return handleConsentPage(url, env);
+    }
+
+    // Email magic-link flow, for signup and for consent
+    if ((url.pathname === '/signup' || url.pathname === '/consent') && request.method === 'POST') {
+      return handleEmailSignIn(request, url, env);
     }
     if (url.pathname === '/auth/email/callback' && request.method === 'GET') {
       return handleEmailCallback(request, url, env);
@@ -135,6 +166,32 @@ export default {
 };
 
 /**
+ * The jethro.au landing page: what the services are, that each is enabled
+ * separately, and where their privacy pages are.
+ */
+function landingPage(env) {
+  const service = (id, what, repo) => `<li><strong>${escapeHtml(SERVICES[id].name)}</strong>: ${what}
+      <a href="${escapeHtml(SERVICES[id].privacyPath)}">Privacy</a> · <a href="${repo}">Source code</a></li>`;
+  const contact = env.PRIVACY_CONTACT
+    ? ` For more information, contact <a href="mailto:${escapeHtml(env.PRIVACY_CONTACT)}">${escapeHtml(env.PRIVACY_CONTACT)}</a>.`
+    : '';
+  return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>jethro.au</title></head>
+<body>
+  <p>jethro.au hosts optional web services for installations of the Jethro church management system:</p>
+  <ul>
+    ${service('url-shortener', 'shortens web addresses in SMS messages sent from Jethro.', 'https://github.com/jethro-chms/jethro-url-shortener')}
+    ${service('sms-shortener', 'suggests shorter wordings for SMS messages being written in Jethro, using Cloudflare Workers AI, so they need fewer SMS segments.', 'https://github.com/jethro-chms/jethro-sms-shortener')}
+  </ul>
+  <p>An installation registers one jethro.au API key, from Jethro's System Configuration page. Each service is then
+  enabled separately: someone signs in and agrees, on behalf of their organisation, to how that service handles data,
+  as described on its privacy page.${contact}</p>
+</body>
+</html>`;
+}
+
+/**
  * Redirect /s/{code} to the target URL. block_bots URLs get a Turnstile
  * challenge page unless the client holds a valid pass cookie.
  */
@@ -142,7 +199,7 @@ async function handleShortUrl(request, url, env) {
   const { code, restPath } = parseShortPath(url);
 
   // Codes never contain ':' — reject early so reserved KV records
-  // (apikey:, idx:, tok:, owner:) are unreachable via public routes
+  // (apikey:, idx:, tok:, owner:, ml:, ct:) are unreachable via public routes
   if (!code || code.includes(':')) {
     return new Response('Invalid short URL', {
       status: 400,
@@ -197,10 +254,13 @@ async function handleShortUrl(request, url, env) {
 /**
  * POST /api/shorten — Create a new short URL
  * Body: { url, code?, campaign?, notes?, block_bots? }
+ *
+ * Admin keys, or create keys whose organisation has an accepted
+ * 'url-shortener' consent (403 consent_required / consent_outdated otherwise).
  */
 async function handleCreateShortUrl(request, env) {
   try {
-    const { err: authErr, auth } = await requireCreate(request, env);
+    const { err: authErr, auth } = await requireService(request, env, 'url-shortener');
     if (authErr) return authErr;
 
     const body = await request.json();
@@ -327,7 +387,7 @@ async function handleListUrls(request, env) {
       totalKeys += listResult.keys.length;
 
       for (const key of listResult.keys) {
-        if (key.name.includes(':')) continue; // skip reserved records (idx:, apikey:, tok:, owner:)
+        if (key.name.includes(':')) continue; // skip reserved records (idx:, apikey:, tok:, owner:, ml:, ct:)
 
         const mapping = await env.URL_MAPPINGS.get(key.name, { type: 'json' });
         if (!mapping || mapping.deleted) continue;
@@ -545,7 +605,7 @@ async function handleListDeletedUrls(request, env) {
       const listResult = await env.URL_MAPPINGS.list({ cursor });
 
       for (const key of listResult.keys) {
-        if (key.name.includes(':')) continue; // skip reserved records (idx:, apikey:, tok:, owner:)
+        if (key.name.includes(':')) continue; // skip reserved records (idx:, apikey:, tok:, owner:, ml:, ct:)
 
         const mapping = await env.URL_MAPPINGS.get(key.name, { type: 'json' });
         if (mapping && mapping.deleted) {
@@ -657,7 +717,7 @@ async function sha256Hex(input) {
 /**
  * Short codes: 1-64 chars of [A-Za-z0-9_-].
  * Excludes ':' so user codes can never collide with reserved KV prefixes
- * (idx:, apikey:, tok:, owner:).
+ * (idx:, apikey:, tok:, owner:, ml:, ct:).
  */
 function isValidShortCode(code) {
   return typeof code === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(code);
@@ -738,10 +798,11 @@ function purgeCacheForCode(ctx, code) {
 }
 
 /**
- * Verify Bearer token API key. Returns { authorized, type, owner?, keyId? }.
+ * Verify Bearer token API key. Returns { authorized, type, owner?, keyId?, createdByCampaign?, key? }.
  *
- * Bootstrap key (env.API_KEY, set via cf workers secrets update) always has admin access.
- * All other keys are looked up O(1) by SHA-256(token) → tok:{hash} → apikey:{id}.
+ * Bootstrap key (env.API_KEY, set via cf workers secrets update) always has admin access
+ * and no KV record (no keyId or key). All other keys are looked up O(1) by
+ * SHA-256(token) → tok:{hash} → apikey:{id}; `key` is that apikey record.
  * There is no plaintext-token walk — keys are always stored hashed.
  */
 async function verifyApiKey(request, env) {
@@ -762,7 +823,10 @@ async function verifyApiKey(request, env) {
   if (tokRef && tokRef.id) {
     const keyData = await env.URL_MAPPINGS.get(`apikey:${tokRef.id}`, { type: 'json' });
     if (keyData) {
-      return { authorized: true, type: keyData.type, owner: keyData.owner, keyId: keyData.id, createdByCampaign: keyData.createdByCampaign };
+      return {
+        authorized: true, type: keyData.type, owner: keyData.owner, keyId: keyData.id,
+        createdByCampaign: keyData.createdByCampaign, key: keyData,
+      };
     }
   }
 
@@ -777,21 +841,6 @@ async function requireAdmin(request, env) {
   if (!auth.authorized) return jsonResponse({ error: 'Unauthorized' }, 401);
   if (auth.type !== 'admin') return jsonResponse({ error: 'Forbidden: admin key required' }, 403);
   return null;
-}
-
-/**
- * Require create (or admin) access.
- * Returns { err, auth }: err is a 401/403 Response or null, auth identifies the caller.
- */
-async function requireCreate(request, env) {
-  const auth = await verifyApiKey(request, env);
-  if (!auth.authorized) {
-    return { err: jsonResponse({ error: 'Unauthorized' }, 401), auth };
-  }
-  if (auth.type !== 'admin' && auth.type !== 'create') {
-    return { err: jsonResponse({ error: 'Forbidden: create key required' }, 403), auth };
-  }
-  return { err: null, auth };
 }
 
 /**
@@ -816,6 +865,7 @@ async function handleListKeys(request, env) {
           tokenPrefix: keyData.tokenPrefix || (keyData.token ? keyData.token.slice(0, 8) + '...' : ''),
           ...(keyData.owner ? { owner: keyData.owner, ownerEmail: keyData.ownerEmail } : {}),
           ...(keyData.createdByCampaign ? { createdByCampaign: keyData.createdByCampaign } : {}),
+          ...(keyData.consents && Object.keys(keyData.consents).length ? { consents: keyData.consents } : {}),
         });
       }
     }
@@ -958,38 +1008,31 @@ async function handleDeleteOwnKey(request, env) {
 /**
  * GET /api/validate — Validate the current Bearer token and return its metadata.
  * Any valid key (admin, create, or self-service) can call this.
+ *
+ * `services` reports, for every service in SERVICES, whether the key's
+ * organisation has agreed to it ({@link consentStatus}) and where its privacy
+ * page is. Admin keys need no consent: consented/accepted/current are true and
+ * version/by/at null.
  */
 async function handleValidateKey(request, env) {
   const auth = await verifyApiKey(request, env);
   if (!auth.authorized) {
     return jsonResponse({ error: 'Unauthorized' }, 401);
   }
+  const services = serviceStatuses(auth, new URL(request.url));
 
   // Bootstrap admin key — no keyId or KV record.
-  if (auth.type === 'admin' && !auth.keyId) {
+  if (!auth.key) {
     return jsonResponse({
       valid: true,
       type: 'admin',
       label: 'Bootstrap admin key',
       created: null,
+      services,
     });
   }
 
-  // Look up the full key record for additional metadata.
-  let keyData = null;
-  if (auth.keyId) {
-    keyData = await env.URL_MAPPINGS.get(`apikey:${auth.keyId}`, { type: 'json' });
-  }
-
-  if (!keyData) {
-    return jsonResponse({
-      valid: true,
-      type: auth.type,
-      label: auth.type === 'admin' ? 'Admin key' : 'Create key',
-      created: null,
-    });
-  }
-
+  const keyData = auth.key;
   return jsonResponse({
     valid: true,
     type: keyData.type,
@@ -1000,6 +1043,7 @@ async function handleValidateKey(request, env) {
     ...(keyData.provider ? { provider: keyData.provider } : {}),
     ...(keyData.createdByCampaign ? { createdByCampaign: keyData.createdByCampaign } : {}),
     tokenPrefix: keyData.tokenPrefix || (keyData.token ? keyData.token.slice(0, 8) + '...' : ''),
+    services,
   });
 }
 
@@ -1017,28 +1061,395 @@ function jsonResponse(data, status = 200) {
 }
 
 // ---------------------------------------------------------------------------
+// jethro.au services and per-service consent.
+//
+// An installation holds one key (see signup below) for every service, but
+// each service also needs its organisation's agreement to that service's
+// data handling: a consent, given by a signed-in person and recorded on the
+// key. Admin keys need none.
+//   apikey:{id}.consents[serviceId] → { version, by, byOwner, at }
+//   ct:{uuid} → { keyId, service, redirect, created }   (consent ticket, 10 min TTL, single use)
+//
+// Consent is given at signup (/signup?service=…, with the agree checkbox) or
+// later: POST /api/consents (Bearer) → /consent?ticket=… → sign-in →
+// redirect with sh_consented. DELETE /api/consents/{service} withdraws it;
+// PUT /api/keys/{id}/consents/{service} (admin) records one given another way.
+// Re-signup carries a key's consents over to its replacement. Services check
+// consent with requireService (here) or GET /api/authorize (other Workers).
+// ---------------------------------------------------------------------------
+
+/**
+ * jethro.au services that need an organisation's consent, by id.
+ *
+ * policyVersion is the "last updated" date of the service's privacy page:
+ * change both together. The URL shortener's page renders its policyVersion;
+ * the SMS shortener's page (POLICY_VERSION in jethro-sms-shortener/privacy.js)
+ * must be edited to match. A consent is accepted while its version >=
+ * minPolicyVersion, and current when it equals policyVersion. Raise
+ * minPolicyVersion only for material changes: every organisation must then
+ * agree again before the service works for it.
+ *
+ * acknowledgement completes "By enabling it, you acknowledge that …".
+ */
+export const SERVICES = {
+  'url-shortener': {
+    name: 'jethro.au URL shortener',
+    policyVersion: '2026-11-18',
+    minPolicyVersion: '2026-11-18',
+    privacyPath: '/url-shortener/privacy',
+    acknowledgement: 'web addresses shortened from Jethro will be stored at jethro.au with your organisation\'s name, '
+      + 'and anyone who has a short link can follow it to the address',
+  },
+  'sms-shortener': {
+    name: 'jethro.au SMS shortener',
+    policyVersion: '2026-11-18',
+    minPolicyVersion: '2026-11-18',
+    privacyPath: '/sms-shortener/privacy',
+    acknowledgement: 'the text of SMS messages being written in Jethro will be sent to jethro.au and processed by Cloudflare Workers AI to suggest shorter wordings',
+  },
+};
+
+const CONSENT_TICKET_TTL = 600; // 10 minutes in seconds
+
+/** The SERVICES entry for an id, or null (own properties only: no '__proto__' and the like). */
+function serviceOf(id) {
+  return typeof id === 'string' && Object.hasOwn(SERVICES, id) ? SERVICES[id] : null;
+}
+
+/** Absolute URL of a service's privacy page, on the origin serving `url`. */
+function servicePrivacyUrl(url, serviceId) {
+  return redirectOrigin(url) + SERVICES[serviceId].privacyPath;
+}
+
+/**
+ * A key's consent to a service.
+ *
+ * @param {object|undefined} keyData  apikey record (undefined for the bootstrap key)
+ * @param {string} serviceId  a SERVICES id
+ * @param {boolean} admin  admin keys need no consent: all true, version/by/at null
+ * @returns {{consented: boolean, accepted: boolean, current: boolean,
+ *   version: string|null, by: string|null, at: string|null}}
+ *   consented: a consent is recorded; accepted: its version >= minPolicyVersion
+ *   (the service works); current: its version === policyVersion
+ */
+function consentStatus(keyData, serviceId, admin) {
+  if (admin) return { consented: true, accepted: true, current: true, version: null, by: null, at: null };
+  const s = SERVICES[serviceId];
+  const c = keyData?.consents?.[serviceId];
+  return {
+    consented: !!c,
+    accepted: !!c && c.version >= s.minPolicyVersion,
+    current: !!c && c.version === s.policyVersion,
+    version: c?.version ?? null,
+    by: c?.by ?? null,
+    at: c?.at ?? null,
+  };
+}
+
+/** The `services` map of /api/validate for a verified key. */
+function serviceStatuses(auth, url) {
+  return Object.fromEntries(Object.keys(SERVICES).map((id) => [id, {
+    name: SERVICES[id].name,
+    ...consentStatus(auth.key, id, auth.type === 'admin'),
+    privacyUrl: servicePrivacyUrl(url, id),
+  }]));
+}
+
+/**
+ * A consent record for a service's current policy, given now by a signed-in identity.
+ *
+ * @param {{owner: string, email: string}} identity
+ */
+function newConsent(serviceId, identity) {
+  return {
+    version: SERVICES[serviceId].policyVersion,
+    by: identity.email,
+    byOwner: identity.owner,
+    at: new Date().toISOString(),
+  };
+}
+
+/**
+ * Require a key that may use a service: admin, or create with an accepted
+ * consent to it.
+ *
+ * @returns {Promise<{err: Response|null, auth: object}>} err: 401 { error: 'Unauthorized' },
+ *   or 403 { error: 'consent_required'|'consent_outdated', service, privacyUrl }
+ */
+async function requireService(request, env, serviceId) {
+  const auth = await verifyApiKey(request, env);
+  if (!auth.authorized) {
+    return { err: jsonResponse({ error: 'Unauthorized' }, 401), auth };
+  }
+  if (auth.type === 'admin') return { err: null, auth };
+  if (auth.type !== 'create') {
+    return { err: jsonResponse({ error: 'Forbidden: create key required' }, 403), auth };
+  }
+  const status = consentStatus(auth.key, serviceId, false);
+  if (!status.accepted) {
+    return {
+      err: jsonResponse({
+        error: status.consented ? 'consent_outdated' : 'consent_required',
+        service: serviceId,
+        privacyUrl: servicePrivacyUrl(new URL(request.url), serviceId),
+      }, 403),
+      auth,
+    };
+  }
+  return { err: null, auth };
+}
+
+/**
+ * GET /api/authorize?service={id} — may the Bearer key use this service?
+ * For other jethro.au Workers, through a service binding.
+ *
+ * → 200 { authorized: true, keyId, service } (keyId null for the bootstrap key);
+ *   401 / 403 as {@link requireService}; 400 for an unknown service.
+ */
+async function handleAuthorize(request, url, env) {
+  const service = url.searchParams.get('service') || '';
+  if (!serviceOf(service)) return jsonResponse({ error: 'Unknown service', service }, 400);
+  const { err, auth } = await requireService(request, env, service);
+  if (err) return err;
+  return jsonResponse({ authorized: true, keyId: auth.keyId ?? null, service });
+}
+
+/**
+ * POST /api/consents — start consent to a service for the Bearer key.
+ * Body: { service, redirect? }
+ *
+ * Stores a single-use ticket (ct:{uuid}, 10 minutes) and returns the page
+ * where a person signs in and agrees: 201 { consentUrl, expiresIn }. After
+ * sign-in they are sent to `redirect` (absolute http(s), as isValidReturnTo)
+ * with sh_consented={service}, or shown a confirmation page without one.
+ * 400 unknown service, invalid redirect, or the bootstrap key (no record to
+ * hold a consent); 401 bad key.
+ */
+async function handleCreateConsentTicket(request, url, env) {
+  const auth = await verifyApiKey(request, env);
+  if (!auth.authorized) return jsonResponse({ error: 'Unauthorized' }, 401);
+  if (!auth.key) return jsonResponse({ error: 'The bootstrap admin key needs no consent' }, 400);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: 'Body must be JSON' }, 400);
+  }
+  const service = body?.service;
+  if (!serviceOf(service)) return jsonResponse({ error: 'Unknown service', service: service ?? null }, 400);
+  const redirect = body.redirect ?? '';
+  if (redirect !== '' && (typeof redirect !== 'string' || !isValidReturnTo(redirect))) {
+    return jsonResponse({ error: 'redirect must be an absolute http(s) URL' }, 400);
+  }
+
+  const ticket = crypto.randomUUID();
+  await env.URL_MAPPINGS.put(`ct:${ticket}`, JSON.stringify({
+    keyId: auth.keyId,
+    service,
+    redirect,
+    created: new Date().toISOString(),
+  }), { expirationTtl: CONSENT_TICKET_TTL });
+
+  return jsonResponse({
+    consentUrl: `${redirectOrigin(url)}/consent?ticket=${ticket}`,
+    expiresIn: CONSENT_TICKET_TTL,
+  }, 201);
+}
+
+/**
+ * DELETE /api/consents/{service} — withdraw the Bearer key's consent to a
+ * service, which then refuses the key. Idempotent: 200 { withdrawn: true, service }.
+ * 400 unknown service or the bootstrap key; 401 bad key.
+ */
+async function handleWithdrawConsent(request, env, serviceId) {
+  const auth = await verifyApiKey(request, env);
+  if (!auth.authorized) return jsonResponse({ error: 'Unauthorized' }, 401);
+  if (!serviceOf(serviceId)) return jsonResponse({ error: 'Unknown service', service: serviceId }, 400);
+  if (!auth.key) return jsonResponse({ error: 'The bootstrap admin key needs no consent' }, 400);
+
+  const key = auth.key;
+  if (key.consents && Object.hasOwn(key.consents, serviceId)) {
+    delete key.consents[serviceId];
+    await env.URL_MAPPINGS.put(`apikey:${key.id}`, JSON.stringify(key));
+  }
+  return jsonResponse({ withdrawn: true, service: serviceId });
+}
+
+/**
+ * PUT /api/keys/{id}/consents/{service} — record a consent on a key (admin only),
+ * for agreement given outside the sign-in flow (e.g. in writing) and for tests.
+ * Body: { by: string (who agreed, e.g. an email address), version?: 'YYYY-MM-DD' }
+ * version defaults to the service's policyVersion; byOwner records the admin key
+ * used ('admin:{keyId}' or 'admin:bootstrap').
+ * → 200 { id, service, consent }; 400 bad service or body; 404 unknown key.
+ */
+async function handleAdminPutConsent(request, env, keyId, serviceId) {
+  const auth = await verifyApiKey(request, env);
+  if (!auth.authorized) return jsonResponse({ error: 'Unauthorized' }, 401);
+  if (auth.type !== 'admin') return jsonResponse({ error: 'Forbidden: admin key required' }, 403);
+  if (!serviceOf(serviceId)) return jsonResponse({ error: 'Unknown service', service: serviceId }, 400);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: 'Body must be JSON' }, 400);
+  }
+  const by = body?.by;
+  if (typeof by !== 'string' || by.trim() === '' || by.length > 254) {
+    return jsonResponse({ error: 'by must be a non-empty string of at most 254 characters' }, 400);
+  }
+  const version = body.version ?? SERVICES[serviceId].policyVersion;
+  if (typeof version !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(version)) {
+    return jsonResponse({ error: 'version must be a date, YYYY-MM-DD' }, 400);
+  }
+
+  const key = await env.URL_MAPPINGS.get(`apikey:${keyId}`, { type: 'json' });
+  if (!key) return jsonResponse({ error: 'Key not found' }, 404);
+  const consent = {
+    version,
+    by: by.trim(),
+    byOwner: `admin:${auth.keyId ?? 'bootstrap'}`,
+    at: new Date().toISOString(),
+  };
+  key.consents = { ...key.consents, [serviceId]: consent };
+  await env.URL_MAPPINGS.put(`apikey:${keyId}`, JSON.stringify(key));
+  return jsonResponse({ id: keyId, service: serviceId, consent });
+}
+
+/**
+ * A live consent ticket and the key it is for, or null when the ticket is
+ * unknown, expired or used, or the key has since been revoked.
+ *
+ * @returns {Promise<{ticket: {keyId: string, service: string, redirect: string, created: string},
+ *   key: object} | null>}
+ */
+async function loadConsentTicket(env, ticketId) {
+  if (typeof ticketId !== 'string' || !/^[0-9a-f-]{36}$/.test(ticketId)) return null;
+  const ticket = await env.URL_MAPPINGS.get(`ct:${ticketId}`, { type: 'json' });
+  if (!ticket || !serviceOf(ticket.service)) return null;
+  const key = await env.URL_MAPPINGS.get(`apikey:${ticket.keyId}`, { type: 'json' });
+  return key ? { ticket, key } : null;
+}
+
+const CONSENT_HEADING = 'Enable a jethro.au service';
+
+/** 410 page for a consent ticket that is expired, used, or whose key was revoked. */
+function consentGonePage(extraHeaders = {}) {
+  return htmlResponse(signupShell(
+    `<p>This link has expired or has already been used, or the API key it was for has been revoked.
+     Please start again from Jethro.</p>`, CONSENT_HEADING), 410, extraHeaders);
+}
+
+/** Label of the required agree checkbox. */
+function agreeLabel(org) {
+  return `I agree to this on behalf of ${org || 'my organisation'}`;
+}
+
+/** What a person agrees to by enabling a service, with a link to its privacy page. */
+function acknowledgementHtml(serviceId, url) {
+  const s = SERVICES[serviceId];
+  return `<p><strong>${escapeHtml(s.name)}:</strong> by enabling it, you acknowledge that ${escapeHtml(s.acknowledgement)}.
+     Please read its <a href="${escapeHtml(servicePrivacyUrl(url, serviceId))}">privacy policy</a>.</p>`;
+}
+
+/**
+ * GET /consent?ticket={uuid} — ask a person to sign in and agree, on behalf of
+ * the key's organisation, to the ticket's service. The sign-in completes in
+ * {@link completeConsentTicket}.
+ */
+async function handleConsentPage(url, env) {
+  const ticketId = url.searchParams.get('ticket') || '';
+  const loaded = await loadConsentTicket(env, ticketId);
+  if (!loaded) return consentGonePage();
+  const { ticket, key } = loaded;
+  const org = key.createdByCampaign || '';
+
+  const form = signInForm(env, { action: '/consent', hidden: { ticket: ticketId }, agree: agreeLabel(org) });
+  if (!form) {
+    return htmlResponse(signupShell('<p>Sign-in is not enabled on this server.</p>', CONSENT_HEADING), 501);
+  }
+  const body = `
+      <p>Enable the <strong>${escapeHtml(SERVICES[ticket.service].name)}</strong> for the jethro.au API key
+      registered to <strong>${escapeHtml(org || 'an unnamed organisation')}</strong>.</p>
+      ${acknowledgementHtml(ticket.service, url)}
+      <p>Sign in to confirm. Your email address, the time and the version of the privacy policy you agreed to are
+      recorded with the key.</p>
+      ${form}`;
+  return htmlResponse(signupShell(body, CONSENT_HEADING));
+}
+
+/**
+ * Finish a consent sign-in: record the ticket's consent on its key, given by
+ * `identity`, use up the ticket, and redirect to the ticket's redirect with
+ * sh_consented={service} (or show a confirmation page). 410 when the ticket
+ * or its key is gone.
+ *
+ * @param {object} extraHeaders  added to the response (e.g. clearing the OAuth state cookie)
+ */
+async function completeConsentTicket(env, url, ticketId, identity, extraHeaders = {}) {
+  const loaded = await loadConsentTicket(env, ticketId);
+  if (!loaded) return consentGonePage(extraHeaders);
+  const { ticket, key } = loaded;
+
+  await env.URL_MAPPINGS.delete(`ct:${ticketId}`);
+  key.consents = { ...key.consents, [ticket.service]: newConsent(ticket.service, identity) };
+  await env.URL_MAPPINGS.put(`apikey:${key.id}`, JSON.stringify(key));
+
+  if (ticket.redirect && isValidReturnTo(ticket.redirect)) {
+    return redirectWith(ticket.redirect, { sh_consented: ticket.service }, extraHeaders);
+  }
+  const body = `
+      <p>Thank you, <strong>${escapeHtml(identity.email)}</strong>. The ${escapeHtml(SERVICES[ticket.service].name)} is now
+      enabled for the jethro.au API key registered to ${escapeHtml(key.createdByCampaign || 'your organisation')}.</p>
+      <p>You can close this page and return to Jethro.</p>`;
+  return htmlResponse(signupShell(body, CONSENT_HEADING), 200, extraHeaders);
+}
+
+/**
+ * 302 to an app's return URL with query parameters added.
+ *
+ * @param {Record<string, string>} params  parameters to set (empty values are skipped)
+ */
+function redirectWith(returnTo, params, extraHeaders = {}) {
+  const r = new URL(returnTo);
+  for (const [k, v] of Object.entries(params)) {
+    if (v) r.searchParams.set(k, v);
+  }
+  return new Response(null, {
+    status: 302,
+    headers: { Location: r.toString(), 'Cache-Control': 'no-store', ...extraHeaders },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Self-service signup: OAuth (Google / GitHub) → create-scoped API key.
 //
 // Flow: GET /signup → GET /auth/{provider}/login (sets a random state cookie,
 // redirects to the provider) → GET /auth/{provider}/callback (verifies state,
-// exchanges the code, resolves a verified email) → mintSelfServiceKey.
+// exchanges the code, resolves a verified email) → finishSignIn.
 //
 // Each identity holds exactly one key; signing in again revokes the old key
-// and mints a fresh one. Tokens are stored hashed:
-//   apikey:{id}     → key record (tokenHash + tokenPrefix, no plaintext)
+// and mints a fresh one, keeping the old key's consents. Tokens are stored hashed:
+//   apikey:{id}     → key record (tokenHash + tokenPrefix, no plaintext, consents)
 //   tok:{sha256}    → { id }        (O(1) auth lookup)
 //   owner:{ident}   → { keyId }     (one-key-per-identity replacement)
 //
+// The same sign-in also confirms a consent (/consent?ticket=…): the ticket
+// rides through the state cookie or magic-link record instead of a signup.
+//
 // Secrets (cf workers secrets update): GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
 // GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET. A provider with no client ID is
-// hidden from /signup and its /auth routes return 501.
+// hidden from /signup and /consent, and its /auth routes return 501.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Self-service signup: email magic link → create-scoped API key.
 //
-// Flow: POST /signup (email) → send magic link with one-time token (KV, 10min
-// TTL) → GET /auth/email/callback?token=... (validate, mint, redirect).
+// Flow: POST /signup or /consent (email) → send magic link with one-time token
+// (ml:{token} in KV, 10min TTL) → GET /auth/email/callback?token=... (validate,
+// finishSignIn).
 //
 // Owners are "email:{sha256(email)}" — one key per verified email address.
 // Requires secrets: EMAIL_API_KEY (Resend API key), EMAIL_FROM (sender address).
@@ -1047,88 +1458,182 @@ function jsonResponse(data, status = 200) {
 const MAGIC_LINK_TOKEN_TTL = 600; // 10 minutes in seconds
 
 /**
- * Services a signup may be for, chosen by ?service= on /signup. A key works
- * for every jethro.au service; the service only adds what the signer must
- * acknowledge (its data handling) to the signup page and magic-link email.
- * Unknown or absent → a plain URL shortener signup.
+ * What a sign-in is for. Carried from the form through the OAuth state cookie
+ * or the magic-link record to {@link finishSignIn}.
+ *
+ * @typedef {{kind: 'signup', redirect: string, campaign: string, service: string, agreed: boolean}
+ *   | {kind: 'consent', ticket: string, service: string, agreed: boolean}} SignInPurpose
+ *   signup: a key, optionally with consent to `service` (a SERVICES id, or '');
+ *   consent: consent on the key of consent ticket `ticket`. agreed: the agree box was ticked.
  */
-const SIGNUP_SERVICES = {
-  'sms-shortener': {
-    name: 'the jethro.au SMS shortener',
-    acknowledgement: 'the text of SMS messages being written in Jethro will be sent to jethro.au and processed by Cloudflare Workers AI to suggest shorter wordings',
-    privacyPath: '/sms-shortener/privacy',
-  },
-};
 
 /**
- * The acknowledgement for a signup's service, or null for a plain signup.
+ * Read a sign-in's purpose from its parameters.
  *
- * @returns {{text: string, html: string} | null}
+ * @param {(name: string) => string} param  request parameter by name ('' when absent)
+ * @param {boolean} consent  a consent sign-in (POST /consent, or a `ticket` parameter)
+ * @returns {SignInPurpose}
  */
-function signupAcknowledgement(service, origin) {
-  const s = SIGNUP_SERVICES[service];
-  if (!s) return null;
-  const privacyUrl = origin + s.privacyPath;
-  const sentence = `By signing up for ${s.name}, you acknowledge that ${s.acknowledgement}.`;
+function signInPurpose(param, consent) {
+  const agreed = param('agree') === '1';
+  if (consent) return { kind: 'consent', ticket: param('ticket'), service: '', agreed };
   return {
-    text: `${sentence} Please see the privacy policy at ${privacyUrl}`,
-    html: `${escapeHtml(sentence)} Please see the <a href="${escapeHtml(privacyUrl)}">privacy policy</a>.`,
+    kind: 'signup',
+    redirect: param('redirect'),
+    campaign: param('campaign').slice(0, 64),
+    service: serviceOf(param('service')) ? param('service') : '',
+    agreed,
   };
 }
 
 /**
- * POST /signup — accept an email address, generate a one-time magic-link
- * token, store it in KV with a TTL, and send the link via email.
+ * Parameters of a sign-in request: form or JSON body fields, falling back to
+ * the query string.
+ *
+ * @returns {Promise<(name: string) => string>}
  */
-async function handleEmailSignup(request, url, env) {
+async function requestParams(request, url) {
+  let fields = {};
+  if (request.method === 'POST') {
+    try {
+      const contentType = request.headers.get('Content-Type') || '';
+      fields = contentType.includes('application/json')
+        ? (await request.json()) ?? {}
+        : Object.fromEntries(await request.formData());
+    } catch {
+      fields = {};
+    }
+  }
+  return (name) => {
+    const v = Object.hasOwn(fields, name) ? fields[name] : url.searchParams.get(name);
+    return typeof v === 'string' ? v.trim() : '';
+  };
+}
+
+/** Where a refused sign-in should go back to: the page it started from. */
+function signInStartUrl(purpose) {
+  if (purpose.kind === 'consent') return `/consent?ticket=${encodeURIComponent(purpose.ticket)}`;
+  const qs = new URLSearchParams();
+  for (const k of ['redirect', 'campaign', 'service']) {
+    if (purpose[k]) qs.set(k, purpose[k]);
+  }
+  return '/signup' + (qs.size ? '?' + qs : '');
+}
+
+/**
+ * Check a sign-in may start: a consent, or a signup for a service, needs the
+ * agree box ticked (enforced here, not only by the browser), and a consent
+ * needs a live ticket. Fills in a consent purpose's service from its ticket.
+ *
+ * @param {SignInPurpose} purpose
+ * @returns {Promise<{error: Response} | {org: string}>} org: the organisation agreed for
+ */
+async function checkSignIn(env, purpose) {
+  if ((purpose.kind === 'consent' || purpose.service) && !purpose.agreed) {
+    const heading = purpose.kind === 'consent' ? CONSENT_HEADING : undefined;
+    return {
+      error: htmlResponse(signupShell(
+        `<p>Please tick “I agree” to continue. <a href="${escapeHtml(signInStartUrl(purpose))}">Back</a>.</p>`, heading), 400),
+    };
+  }
+  if (purpose.kind === 'consent') {
+    const loaded = await loadConsentTicket(env, purpose.ticket);
+    if (!loaded) return { error: consentGonePage() };
+    purpose.service = loaded.ticket.service;
+    return { org: loaded.key.createdByCampaign || '' };
+  }
+  return { org: purpose.campaign };
+}
+
+/**
+ * Finish a sign-in for `identity`: record a consent ({@link completeConsentTicket}),
+ * or mint the identity's key — with consent to the signup's service — and
+ * redirect back with sh_apikey, sh_email, sh_replaced and sh_consented, or show
+ * the key.
+ *
+ * @param {SignInPurpose} purpose  as checked by {@link checkSignIn} when the sign-in started
+ * @param {object} extraHeaders  added to the response
+ */
+async function finishSignIn(env, url, purpose, identity, extraHeaders = {}) {
+  if (purpose.kind === 'consent') {
+    return completeConsentTicket(env, url, purpose.ticket, identity, extraHeaders);
+  }
+  const service = purpose.agreed && serviceOf(purpose.service) ? purpose.service : '';
+  const { token, replaced, consented } = await mintSelfServiceKey(env, identity, purpose.campaign, service);
+
+  // If the signup was initiated from an app integration, redirect back with
+  // the key instead of showing it (see isValidReturnTo for the accepted risk).
+  if (purpose.redirect && isValidReturnTo(purpose.redirect)) {
+    return redirectWith(purpose.redirect, {
+      sh_apikey: token,
+      sh_email: identity.email,
+      sh_replaced: replaced ? '1' : '',
+      sh_consented: consented,
+    }, extraHeaders);
+  }
+
+  const body = `
+      <p>Signed in as <strong>${escapeHtml(identity.email)}</strong>.</p>
+      ${replaced ? '<p>Your previous key has been revoked and replaced.</p>' : ''}
+      ${consented ? `<p>The ${escapeHtml(SERVICES[consented].name)} is enabled for this key.</p>` : ''}
+      <p>Your API key — <strong>copy it now; it is shown only once</strong>:</p>
+      <pre><code>${escapeHtml(token)}</code></pre>
+      <p>Use it as a Bearer token:</p>
+      <pre><code>curl -X POST ${escapeHtml(redirectOrigin(url))}/api/shorten \\
+  -H "Authorization: Bearer ${escapeHtml(token)}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"url": "https://example.com/some/long/path"}'</code></pre>
+      <p>Lost it? Just <a href="/signup">sign in again</a> for a new key.</p>`;
+  return htmlResponse(signupShell(body), 200, extraHeaders);
+}
+
+/**
+ * POST /signup, POST /consent — accept an email address, store a one-time
+ * magic-link token (ml:{token} → { email, purpose }, 10 minutes) and send
+ * the link. Accepts form or JSON bodies; signup parameters may also come
+ * from the query string.
+ */
+async function handleEmailSignIn(request, url, env) {
   if (!env.EMAIL_API_KEY || !env.EMAIL_FROM) {
-    return htmlResponse(signupShell('<p>Email signup is not enabled on this server.</p>'), 501);
+    return htmlResponse(signupShell('<p>Email sign-in is not enabled on this server.</p>'), 501);
   }
 
-  // Accept both JSON and form-encoded requests.
-  let email, campaign;
-  const contentType = request.headers.get('Content-Type') || '';
-  if (contentType.includes('application/json')) {
-    const body = await request.json();
-    email = (body.email || '').trim();
-    campaign = (body.campaign || '').slice(0, 64);
-  } else {
-    const form = await request.formData();
-    email = (form.get('email') || '').trim();
-    campaign = (form.get('campaign') || '').slice(0, 64);
-  }
+  const param = await requestParams(request, url);
+  const purpose = signInPurpose(param, url.pathname === '/consent' || param('ticket') !== '');
+  const check = await checkSignIn(env, purpose);
+  if (check.error) return check.error;
 
+  const email = param('email');
   if (!email || !email.includes('@') || email.length > 254) {
-    return htmlResponse(signupShell('<p>Please enter a valid email address. <a href="/signup">Try again</a>.</p>'), 400);
+    return htmlResponse(signupShell(
+      `<p>Please enter a valid email address. <a href="${escapeHtml(signInStartUrl(purpose))}">Try again</a>.</p>`), 400);
   }
 
   const token = crypto.randomUUID();
-  const redirect = url.searchParams.get('redirect') || '';
-
-  // Store the token in KV with a TTL. Use expiration metadata for auto-cleanup.
   await env.URL_MAPPINGS.put(
     `ml:${token}`,
-    JSON.stringify({ email, redirect, campaign, created: new Date().toISOString() }),
+    JSON.stringify({ email, purpose, created: new Date().toISOString() }),
     { expirationTtl: MAGIC_LINK_TOKEN_TTL }
   );
 
-  const sent = await sendMagicLink(email, token, redirectOrigin(url), env, url.searchParams.get('service') || '');
+  const sent = await sendMagicLink(email, token, redirectOrigin(url), env, purpose, check.org);
   if (!sent) {
     // Clean up the KV entry so it can't be used later.
     await env.URL_MAPPINGS.delete(`ml:${token}`);
-    return htmlResponse(signupShell('<p>Failed to send the email. Please try again later. <a href="/signup">Back</a>.</p>'), 502);
+    return htmlResponse(signupShell(
+      `<p>Failed to send the email. Please try again later. <a href="${escapeHtml(signInStartUrl(purpose))}">Back</a>.</p>`), 502);
   }
 
   return htmlResponse(signupShell(
     `<p>A magic link has been sent to <strong>${escapeHtml(email)}</strong>.</p>
-     <p>Check your inbox and click the link to receive your API key.
-     The link expires in 10 minutes.</p>`
+     <p>Check your inbox and click the link to ${purpose.kind === 'consent' ? 'confirm' : 'receive your API key'}.
+     The link expires in 10 minutes.</p>`, purpose.kind === 'consent' ? CONSENT_HEADING : undefined
   ));
 }
 
 /**
- * GET /auth/email/callback?token=... — validate the magic-link token, mint a
- * create-scoped key, and show the result (or redirect if `redirect` was set).
+ * GET /auth/email/callback?token=... — use up the magic-link token and finish
+ * the sign-in it was sent for ({@link finishSignIn}).
  */
 async function handleEmailCallback(request, url, env) {
   const token = url.searchParams.get('token');
@@ -1138,7 +1643,7 @@ async function handleEmailCallback(request, url, env) {
   }
 
   const record = await env.URL_MAPPINGS.get(`ml:${token}`, { type: 'json' });
-  if (!record) {
+  if (!record || !record.purpose) {
     return htmlResponse(signupShell('<p>This link has expired or already been used. <a href="/signup">Request a new one</a>.</p>'), 410);
   }
 
@@ -1146,43 +1651,12 @@ async function handleEmailCallback(request, url, env) {
   await env.URL_MAPPINGS.delete(`ml:${token}`);
 
   const email = record.email || '';
-  const campaign = record.campaign || '';
   // Owner identity is a hash so emails aren't stored in plaintext in the KV key.
   const owner = 'email:' + (await sha256Hex(email));
   const identity = { owner, email, provider: 'email' };
 
   try {
-    const { token: apiToken, replaced } = await mintSelfServiceKey(env, identity, campaign);
-
-    // If the signup was initiated from an app integration, redirect back.
-    const returnTo = record.redirect || '';
-    if (returnTo && isValidReturnTo(returnTo, url)) {
-      const r = new URL(returnTo, url.origin);
-      r.searchParams.set('sh_apikey', apiToken);
-      r.searchParams.set('sh_email', email);
-      if (replaced) r.searchParams.set('sh_replaced', '1');
-      return new Response(null, {
-        status: 302,
-        headers: {
-          Location: r.toString(),
-          'Cache-Control': 'no-store',
-        },
-      });
-    }
-
-    const body = `
-      <p>Signed in as <strong>${escapeHtml(email)}</strong>.</p>
-      ${replaced ? '<p>Your previous key has been revoked and replaced.</p>' : ''}
-      <p>Your API key — <strong>copy it now; it is shown only once</strong>:</p>
-      <pre><code>${escapeHtml(apiToken)}</code></pre>
-      <p>Use it as a Bearer token:</p>
-      <pre><code>curl -X POST ${escapeHtml(redirectOrigin(url))}/api/shorten \\
-  -H "Authorization: Bearer ${escapeHtml(apiToken)}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"url": "https://example.com/some/long/path"}'</code></pre>
-      <p>Lost it? Just <a href="/signup">sign in again</a> for a new key.</p>`;
-
-    return htmlResponse(signupShell(body));
+    return await finishSignIn(env, url, record.purpose, identity);
   } catch (error) {
     console.error('Email callback failed:', error);
     return htmlResponse(signupShell('<p>Sign-in failed. <a href="/signup">Try again</a>.</p>'), 502);
@@ -1192,14 +1666,28 @@ async function handleEmailCallback(request, url, env) {
 /**
  * Send a magic-link email via Resend (resend.com).
  *
- * Requires env.EMAIL_API_KEY (Resend API key) and env.EMAIL_FROM. For a
- * service with an acknowledgement (SIGNUP_SERVICES), the email states it and
- * links the privacy policy. Returns true on success.
+ * Requires env.EMAIL_API_KEY (Resend API key) and env.EMAIL_FROM. The email
+ * says what the link is for: a key, a key with a service enabled, or a
+ * consent; for a service it repeats what was agreed and links the service's
+ * privacy policy. Returns true on success.
+ *
+ * @param {SignInPurpose} purpose  as checked by {@link checkSignIn} (service filled in)
+ * @param {string} org  the organisation agreed for ('' = unnamed)
  */
-async function sendMagicLink(email, token, origin, env, service = '') {
+async function sendMagicLink(email, token, origin, env, purpose, org) {
   const link = `${origin}/auth/email/callback?token=${encodeURIComponent(token)}`;
-  const ack = signupAcknowledgement(service, origin);
-  const serviceName = SIGNUP_SERVICES[service]?.name ?? 'the jethro.au URL shortener';
+  const s = serviceOf(purpose.service);
+  const onBehalf = org || 'your organisation';
+  let subject, intro;
+  if (purpose.kind === 'consent') {
+    subject = `Confirm: enable the ${s.name}`;
+    intro = `Click the link below to confirm that you agree, on behalf of ${onBehalf}, to enabling the ${s.name} for its jethro.au API key:`;
+  } else {
+    subject = 'Your jethro.au API key — magic link';
+    intro = `Click the link below to receive your jethro.au API key${s ? ` and enable the ${s.name}` : ''}:`;
+  }
+  const ack = s ? `By enabling it, you acknowledge, on behalf of ${onBehalf}, that ${s.acknowledgement}.` : '';
+  const privacyUrl = s ? origin + s.privacyPath : '';
 
   try {
     const resp = await fetch('https://api.resend.com/emails', {
@@ -1211,13 +1699,15 @@ async function sendMagicLink(email, token, origin, env, service = '') {
       body: JSON.stringify({
         from: env.EMAIL_FROM,
         to: [email],
-        subject: 'Your jethro.au API key — magic link',
-        text: `Sign in to receive your API key for ${serviceName}:\n\n${link}\n\nThis link expires in 10 minutes. If you didn't request this, you can ignore this email.`
-          + (ack ? `\n\n${ack.text}` : ''),
-        html: `<p>Click the link below to receive your API key for ${escapeHtml(serviceName)}:</p>
-<p><a href="${link}">${link}</a></p>
-<p>This link expires in 10 minutes.</p>
-<p>If you didn't request this, you can ignore this email.</p>` + (ack ? `\n<p>${ack.html}</p>` : ''),
+        subject,
+        text: `${intro}\n\n${link}\n\n`
+          + (s ? `${ack} Privacy policy: ${privacyUrl}\n\n` : '')
+          + `This link expires in 10 minutes. If you didn't request this, you can ignore this email.`,
+        html: `<p>${escapeHtml(intro)}</p>
+<p><a href="${link}">${link}</a></p>`
+          + (s ? `\n<p>${escapeHtml(ack)} Please see the <a href="${escapeHtml(privacyUrl)}">privacy policy</a>.</p>` : '')
+          + `\n<p>This link expires in 10 minutes.</p>
+<p>If you didn't request this, you can ignore this email.</p>`,
       }),
     });
 
@@ -1250,87 +1740,97 @@ const OAUTH_PROVIDERS = {
 };
 
 /**
- * GET /signup — provider picker page
+ * The sign-in form shared by /signup and /consent: one form, so its agree
+ * checkbox gates every way of signing in. The email button posts to `action`;
+ * each configured OAuth provider's button submits the same fields by GET to
+ * /auth/{provider}/login. Returns null when no sign-in method is configured.
+ *
+ * @param {{action: string, hidden: Record<string, string>, agree: string|null}} options
+ *   hidden: fields to carry (empty values skipped); agree: label of the
+ *   required agree checkbox, or null for none
  */
-function handleSignupPage(url, env) {
-  const redirect = url.searchParams.get('redirect') || '';
-  const campaign = url.searchParams.get('campaign') || '';
-  const service = url.searchParams.get('service') || '';
-  // Carried to the email form's POST and the OAuth login links.
-  const qs = new URLSearchParams();
-  if (redirect) qs.set('redirect', redirect);
-  if (redirect && campaign) qs.set('campaign', campaign);
-  if (SIGNUP_SERVICES[service]) qs.set('service', service);
-  const redirectQS = qs.size ? '?' + qs.toString() : '';
-
-  const oauthButtons = Object.entries(OAUTH_PROVIDERS)
-    .filter(([, p]) => p.clientId(env))
-    .map(([id, p]) => `<a class="btn" href="/auth/${id}/login${redirectQS}">Sign in with ${p.name}</a>`);
-
+function signInForm(env, { action, hidden, agree }) {
+  const providers = Object.entries(OAUTH_PROVIDERS).filter(([, p]) => p.clientId(env));
   const emailEnabled = !!(env.EMAIL_API_KEY && env.EMAIL_FROM);
+  if (providers.length === 0 && !emailEnabled) return null;
 
-  // If nothing is configured, return 501.
-  if (oauthButtons.length === 0 && !emailEnabled) {
-    return htmlResponse(signupShell('<p>Self-service signup is not enabled on this server.</p>'), 501);
+  let html = `<form method="post" action="${escapeHtml(action)}">`;
+  for (const [name, value] of Object.entries(hidden)) {
+    if (value) html += `\n        <input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`;
   }
-
-  const purpose = SIGNUP_SERVICES[service] ? `using ${escapeHtml(SIGNUP_SERVICES[service].name)}` : 'creating short URLs';
-  let body = `<p>Sign in to receive an API key for ${purpose}.
-     You get one key, which works for all jethro.au services; signing in again replaces it.</p>`;
-  const ack = signupAcknowledgement(service, redirectOrigin(url));
-  if (ack) {
-    body += `\n      <p><strong>${ack.html}</strong></p>`;
+  if (agree) {
+    html += `
+        <p><label><input type="checkbox" name="agree" value="1" required> ${escapeHtml(agree)}</label></p>`;
   }
-
-  // Magic-link email form.
+  // Email is checked by the server rather than marked required, so that the
+  // provider buttons can submit the form without it.
   if (emailEnabled) {
-    const campaignInput = campaign
-      ? `<input type="hidden" name="campaign" value="${escapeHtml(campaign)}">`
-      : '';
-    body += `
-      <form method="post" action="/signup${redirectQS}">${campaignInput}
+    html += `
         <p>
           <label for="email">Email address:</label><br>
-          <input type="email" id="email" name="email" required
+          <input type="email" id="email" name="email"
                  placeholder="you@example.com"
                  style="padding:0.5em;width:100%;max-width:24em;box-sizing:border-box;">
         </p>
-        <p>
-          <button type="submit" class="btn" style="cursor:pointer;">
-            Send magic link
-          </button>
-        </p>
-      </form>`;
+        <p><button type="submit" class="btn">Send magic link</button></p>`;
   }
-
-  if (oauthButtons.length > 0) {
-    if (emailEnabled) {
-      body += '<hr style="margin:1.5em 0"><p>Or sign in with a provider:</p>';
+  if (providers.length > 0) {
+    if (emailEnabled) html += '\n        <hr style="margin:1.5em 0"><p>Or sign in with a provider:</p>';
+    for (const [id, p] of providers) {
+      html += `\n        <button type="submit" class="btn" formmethod="get" formaction="/auth/${id}/login">Sign in with ${p.name}</button>`;
     }
-    body += '\n      ' + oauthButtons.join('\n      ');
   }
-
-  return htmlResponse(signupShell(body));
+  return html + '\n      </form>';
 }
 
 /**
- * GET /auth/{provider}/login — set CSRF state cookie, redirect to provider
+ * GET /signup?redirect=&campaign=&service= — sign-in page for a jethro.au API
+ * key. With a known `service`, the page states what enabling it means, links
+ * its privacy policy and requires the agree checkbox; the key is minted with
+ * that consent.
  */
-function handleOAuthLogin(url, env, providerId) {
+function handleSignupPage(url, env) {
+  const purpose = signInPurpose((name) => (url.searchParams.get(name) || '').trim(), false);
+  const s = serviceOf(purpose.service);
+
+  const form = signInForm(env, {
+    action: '/signup',
+    hidden: { redirect: purpose.redirect, campaign: purpose.campaign, service: purpose.service },
+    agree: s ? agreeLabel(purpose.campaign) : null,
+  });
+  if (!form) {
+    return htmlResponse(signupShell('<p>Self-service signup is not enabled on this server.</p>'), 501);
+  }
+
+  let body = s
+    ? `<p>Sign in to receive your jethro.au API key and enable the ${escapeHtml(s.name)}.`
+    : '<p>Sign in to receive a jethro.au API key.';
+  body += ` Your installation needs one key; each jethro.au service is enabled for it separately.
+     Signing in again replaces it.</p>`;
+  if (s) body += '\n      ' + acknowledgementHtml(purpose.service, url);
+  return htmlResponse(signupShell(body + '\n      ' + form));
+}
+
+/**
+ * GET /auth/{provider}/login — check the sign-in may start ({@link checkSignIn}),
+ * set the CSRF state cookie (carrying the sign-in's purpose) and redirect to
+ * the provider.
+ */
+async function handleOAuthLogin(url, env, providerId) {
   const provider = OAUTH_PROVIDERS[providerId];
   if (!provider.clientId(env)) {
     return htmlResponse(signupShell(`<p>${provider.name} sign-in is not configured.</p>`), 501);
   }
 
+  const param = (name) => (url.searchParams.get(name) || '').trim();
+  const purpose = signInPurpose(param, param('ticket') !== '');
+  const check = await checkSignIn(env, purpose);
+  if (check.error) return check.error;
+  if (purpose.kind === 'signup' && !isValidReturnTo(purpose.redirect)) purpose.redirect = '';
+
   const state = Array.from(crypto.getRandomValues(new Uint8Array(16)))
     .map((b) => b.toString(16).padStart(2, '0')).join('');
-
-  // Pass post-signup redirect and campaign through the state cookie.
-  const returnTo = url.searchParams.get('redirect') || '';
-  const returnToValid = isValidReturnTo(returnTo, url) ? returnTo : '';
-  const campaign = (url.searchParams.get('campaign') || '').slice(0, 64);
-
-  const cookieValue = JSON.stringify({ state, returnTo: returnToValid, campaign });
+  const cookieValue = JSON.stringify({ state, purpose });
 
   const redirectUri = redirectOrigin(url) + `/auth/${providerId}/callback`;
 
@@ -1353,7 +1853,8 @@ function handleOAuthLogin(url, env, providerId) {
 }
 
 /**
- * GET /auth/{provider}/callback — verify state, exchange code, mint key
+ * GET /auth/{provider}/callback — verify state, exchange the code, and finish
+ * the sign-in ({@link finishSignIn}).
  */
 async function handleOAuthCallback(request, url, env, providerId) {
   const provider = OAUTH_PROVIDERS[providerId];
@@ -1367,19 +1868,13 @@ async function handleOAuthCallback(request, url, env, providerId) {
 
   const state = url.searchParams.get('state');
   const cookieRaw = getCookie(request, STATE_COOKIE);
-  let cookieState, returnTo, campaign;
+  let cookie = null;
   try {
-    const parsed = cookieRaw ? JSON.parse(decodeURIComponent(cookieRaw)) : null;
-    cookieState = parsed?.state;
-    returnTo = parsed?.returnTo || '';
-    campaign = parsed?.campaign || '';
+    cookie = cookieRaw ? JSON.parse(decodeURIComponent(cookieRaw)) : null;
   } catch {
-    // Legacy cookie (plain string, no redirect support)
-    cookieState = cookieRaw;
-    returnTo = '';
-    campaign = '';
+    cookie = null;
   }
-  if (!state || !cookieState || state !== cookieState) {
+  if (!state || !cookie?.state || state !== cookie.state || !cookie.purpose) {
     return htmlResponse(signupShell('<p>Sign-in session expired or invalid. <a href="/signup">Try again</a>.</p>'), 400);
   }
 
@@ -1388,47 +1883,13 @@ async function handleOAuthCallback(request, url, env, providerId) {
     return htmlResponse(signupShell('<p>Missing authorization code. <a href="/signup">Try again</a>.</p>'), 400);
   }
 
+  const clearCookie = {
+    'Set-Cookie': `${STATE_COOKIE}=; HttpOnly; Secure; Path=/auth; SameSite=Lax; Max-Age=0`,
+  };
   try {
     const redirectUri = redirectOrigin(url) + `/auth/${providerId}/callback`;
     const identity = await provider.fetchIdentity(code, redirectUri, env);
-    const { token, replaced } = await mintSelfServiceKey(env, identity, campaign);
-
-    // If the signup was initiated from an app integration, redirect back
-    // with the token instead of showing the HTML success page.
-    // Validate same-origin again as defense-in-depth (the cookie is
-    // HttpOnly, but the original redirect param is attacker-controlled).
-    const returnToValid = isValidReturnTo(returnTo, url) ? returnTo : '';
-    if (returnToValid) {
-      const r = new URL(returnToValid, url.origin);
-      r.searchParams.set('sh_apikey', token);
-      r.searchParams.set('sh_email', identity.email);
-      if (replaced) r.searchParams.set('sh_replaced', '1');
-      return new Response(null, {
-        status: 302,
-        headers: {
-          Location: r.toString(),
-          'Set-Cookie': `${STATE_COOKIE}=; HttpOnly; Secure; Path=/auth; SameSite=Lax; Max-Age=0`,
-          'Cache-Control': 'no-store',
-        },
-      });
-    }
-
-    const body = `
-      <p>Signed in as <strong>${escapeHtml(identity.email)}</strong>.</p>
-      ${replaced ? '<p>Your previous key has been revoked and replaced.</p>' : ''}
-      <p>Your API key — <strong>copy it now; it is shown only once</strong>:</p>
-      <pre><code>${escapeHtml(token)}</code></pre>
-      <p>Use it as a Bearer token:</p>
-      <pre><code>curl -X POST ${escapeHtml(redirectOrigin(url))}/api/shorten \\
-  -H "Authorization: Bearer ${escapeHtml(token)}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"url": "https://example.com/some/long/path"}'</code></pre>
-      <p>Lost it? Just <a href="/signup">sign in again</a> for a new key.</p>`;
-
-    return htmlResponse(signupShell(body), 200, {
-      // Expire the state cookie
-      'Set-Cookie': `${STATE_COOKIE}=; HttpOnly; Secure; Path=/auth; SameSite=Lax; Max-Age=0`,
-    });
+    return await finishSignIn(env, url, cookie.purpose, identity, clearCookie);
   } catch (error) {
     console.error(`OAuth ${providerId} callback failed:`, error);
     return htmlResponse(signupShell('<p>Sign-in failed. <a href="/signup">Try again</a>.</p>'), 502);
@@ -1506,14 +1967,19 @@ async function fetchGithubIdentity(code, redirectUri, env) {
 }
 
 /**
- * Mint a create-scoped key for an identity, revoking any key it already holds.
+ * Mint a create-scoped key for an identity, revoking any key it already holds;
+ * the revoked key's consents carry over to the new one.
+ *
  * @param {string} campaign - optional campaign id from the signup flow (max 64 chars)
- * Returns { token, replaced }.
+ * @param {string} service - a SERVICES id the signer agreed to on the signup page, or ''
+ * @returns {Promise<{token: string, replaced: boolean, consented: string}>}
+ *   consented: `service` when its consent was recorded now, else ''
  */
-async function mintSelfServiceKey(env, identity, campaign = '') {
+async function mintSelfServiceKey(env, identity, campaign = '', service = '') {
   const ownerKey = `owner:${identity.owner}`;
   const prev = await env.URL_MAPPINGS.get(ownerKey, { type: 'json' });
   let replaced = false;
+  let consents = {};
 
   if (prev && prev.keyId) {
     const prevKey = await env.URL_MAPPINGS.get(`apikey:${prev.keyId}`, { type: 'json' });
@@ -1521,8 +1987,12 @@ async function mintSelfServiceKey(env, identity, campaign = '') {
     if (prevKey && prevKey.tokenHash) {
       await env.URL_MAPPINGS.delete(`tok:${prevKey.tokenHash}`);
     }
+    consents = { ...prevKey?.consents };
     replaced = true;
   }
+
+  const consented = serviceOf(service) ? service : '';
+  if (consented) consents[consented] = newConsent(consented, identity);
 
   const id = crypto.randomUUID();
   const token = 'cus_' + crypto.randomUUID().replace(/-/g, '');
@@ -1537,6 +2007,7 @@ async function mintSelfServiceKey(env, identity, campaign = '') {
     tokenPrefix: token.slice(0, 8) + '...',
     tokenHash,
     created: new Date().toISOString(),
+    consents,
   };
 
   if (campaign) {
@@ -1547,7 +2018,7 @@ async function mintSelfServiceKey(env, identity, campaign = '') {
   await env.URL_MAPPINGS.put(`tok:${tokenHash}`, JSON.stringify({ id }));
   await env.URL_MAPPINGS.put(ownerKey, JSON.stringify({ keyId: id }));
 
-  return { token, replaced };
+  return { token, replaced, consented };
 }
 
 /**
@@ -1616,23 +2087,29 @@ function escapeHtml(s) {
     .replaceAll("'", '&#39;');
 }
 
-function signupShell(body) {
+/**
+ * HTML page for the signup and consent flows.
+ *
+ * @param {string} body  HTML content
+ * @param {string} heading  page heading (and title)
+ */
+function signupShell(body, heading = 'Get an API key') {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>URL Shortener — API key signup</title>
+  <title>jethro.au — ${escapeHtml(heading)}</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; line-height: 1.5; }
     .btn { display: inline-block; margin: 0.5rem 0.5rem 0.5rem 0; padding: 0.6rem 1.2rem; border: 1px solid #888;
-           border-radius: 6px; text-decoration: none; color: inherit; }
+           border-radius: 6px; text-decoration: none; color: inherit; background: none; font: inherit; cursor: pointer; }
     pre { background: #f4f4f4; padding: 1rem; border-radius: 6px; overflow-x: auto; }
     @media (prefers-color-scheme: dark) { body { background: #111; color: #eee; } pre { background: #222; } }
   </style>
 </head>
 <body>
-  <h1>Get an API key</h1>
+  <h1>${escapeHtml(heading)}</h1>
   ${body}
 </body>
 </html>`;

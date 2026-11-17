@@ -1,7 +1,14 @@
 <?php
 // SPDX-License-Identifier: Apache-2.0
 /**
- * URL Shortener abstraction.
+ * URL Shortener abstraction, and the client for the jethro.au URL shortener.
+ *
+ * The API key is the installation's jethro.au key (constant JETHROAU_API_KEY),
+ * shared with the other jethro.au services. Shortening also needs the
+ * organisation's consent to the URL shortener, recorded at jethro.au: given at
+ * signup (getSignupUrl() with $service 'url-shortener') or later through
+ * POST /api/consents (see PHP_INTEGRATION.md). Without it shorten() throws
+ * "URL shortener: API error (consent_required)" (or consent_outdated).
  */
 
 interface UrlShortener
@@ -25,19 +32,28 @@ class JethroAuUrlShortener implements UrlShortener
     ) {}
 
     /**
-     * Build the URL that starts the self-service OAuth signup flow.
+     * Build the URL that starts the self-service signup flow (OAuth or email
+     * magic link) for the installation's jethro.au API key.
      *
      * After sign-in, the worker redirects back to $redirectAfter with:
-     *   ?sh_apikey=<token>&sh_email=<email>[&sh_replaced=1]
+     *   ?sh_apikey=<token>&sh_email=<email>[&sh_replaced=1][&sh_consented=<service>]
      *
      * @param string $redirectAfter Absolute URL on your site to receive the API key
-     * @param string $campaign      Optional campaign id to stamp on the key (max 64 chars)
+     * @param string $campaign      Optional campaign id to stamp on the key (max 64 chars):
+     *                              your organisation's name, shown when agreeing to services
+     * @param string $service       Optional jethro.au service id (e.g. 'url-shortener',
+     *                              'sms-shortener'): the signup page then asks the signer to
+     *                              agree to it on the organisation's behalf, and the key is
+     *                              minted with that consent (sh_consented=<service>)
      */
-    public function getSignupUrl(string $redirectAfter, string $campaign = ''): string
+    public function getSignupUrl(string $redirectAfter, string $campaign = '', string $service = ''): string
     {
         $url = $this->signupBase . '/signup?redirect=' . urlencode($redirectAfter);
         if ($campaign !== '') {
             $url .= '&campaign=' . urlencode($campaign);
+        }
+        if ($service !== '') {
+            $url .= '&service=' . urlencode($service);
         }
         return $url;
     }
@@ -53,7 +69,8 @@ class JethroAuUrlShortener implements UrlShortener
     /**
      * Extract the API-key payload from a signup callback, or null if absent/invalid.
      *
-     * @return array{token: string, email: string, replaced: bool}|null
+     * @return array{token: string, email: string, replaced: bool, consented: string}|null
+     *         consented: the service consented to at signup ('' for none)
      */
     public static function getTokenFromCallback(): ?array
     {
@@ -69,6 +86,7 @@ class JethroAuUrlShortener implements UrlShortener
             'token' => $token,
             'email' => $email !== '' ? $email : 'unknown',
             'replaced' => !empty($_GET['sh_replaced']),
+            'consented' => (string)($_GET['sh_consented'] ?? ''),
         ];
     }
 
@@ -124,6 +142,12 @@ class JethroAuUrlShortener implements UrlShortener
     }
 }
 
+/**
+ * The configured URL shortener (memoized), using the installation's jethro.au
+ * API key from the JETHROAU_API_KEY constant ('' when undefined).
+ *
+ * @throws \RuntimeException when URLSHORTENER is blank or unsupported
+ */
 function getUrlShortener(): UrlShortener
 {
     static $shortener = null;
@@ -136,7 +160,7 @@ function getUrlShortener(): UrlShortener
         throw new \RuntimeException("Unsupported URLSHORTENER: {$config['raw']}. Use 'jethroau' or 'https://jethro.au'.");
     }
     return $shortener = new JethroAuUrlShortener(
-        apiKey: defined('URLSHORTENER_API_KEY') ? (string) URLSHORTENER_API_KEY : '',
+        apiKey: defined('JETHROAU_API_KEY') ? (string) JETHROAU_API_KEY : '',
         endpoint: $config['base'] . '/api/shorten',
         signupBase: $config['base'],
     );

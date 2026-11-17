@@ -2,7 +2,7 @@
 URL Shortener Python Client
 A lightweight client for the Cloudflare Workers URL Shortener API.
 
-    export URLSHORTENER_API_KEY=your-api-key         # required (create)
+    export JETHROAU_API_KEY=your-api-key             # required (create, with url-shortener consent)
     export URLSHORTENER_ADMIN_KEY=your-admin-key     # optional (list, update, delete, restore)
     export URLSHORTENER_BASE_URL=https://yourdomain.com
 
@@ -29,12 +29,12 @@ class URLShortenerClient:
         base_url: Optional[str] = None,
         admin_key: Optional[str] = None,
     ):
-        self.api_key = api_key or os.getenv("URLSHORTENER_API_KEY")
+        self.api_key = api_key or os.getenv("JETHROAU_API_KEY")
         self.admin_key = admin_key or os.getenv("URLSHORTENER_ADMIN_KEY")
         self.base_url = (base_url or os.getenv("URLSHORTENER_BASE_URL", "")).rstrip("/")
 
         if not self.api_key:
-            raise ValueError("API key required: set URLSHORTENER_API_KEY env var or pass api_key=")
+            raise ValueError("API key required: set JETHROAU_API_KEY env var or pass api_key=")
         if not self.base_url:
             raise ValueError("Base URL required: set URLSHORTENER_BASE_URL env var or pass base_url=")
 

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 require_once __DIR__ . '/UrlShortener.php';
 define('URLSHORTENER', getenv('URLSHORTENER') ?: 'jethroau');
-define('URLSHORTENER_API_KEY', getenv('URLSHORTENER_API_KEY') ?: '');
+define('JETHROAU_API_KEY', getenv('JETHROAU_API_KEY') ?: '');
 
 if ($argc < 2) { fprintf(STDERR, "Usage: php src/php/shorten.php <url> [campaign]\n"); exit(1); }
 $url = $argv[1];

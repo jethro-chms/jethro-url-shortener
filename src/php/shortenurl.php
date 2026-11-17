@@ -3,8 +3,8 @@
 /**
  * URL Shortener library — create short URLs via jethro.au API.
  *
- * Requires URLSHORTENER_API_KEY environment variable (set by devbox.json env).
- * Uses a create-only key — safe to commit; cannot list/delete/update URLs.
+ * Requires the JETHROAU_API_KEY environment variable (set by devbox.json env):
+ * a create key, with the url-shortener consent, which cannot list/delete/update URLs.
  */
 
 /**
@@ -16,9 +16,9 @@
  * @throws RuntimeException On API or network error.
  */
 function shorten_url(string $url, string $campaign = 'general'): array {
-    $apiKey = getenv('URLSHORTENER_API_KEY');
+    $apiKey = getenv('JETHROAU_API_KEY');
     if (!$apiKey) {
-        throw new RuntimeException('URLSHORTENER_API_KEY environment variable not set');
+        throw new RuntimeException('JETHROAU_API_KEY environment variable not set');
     }
 
     $ch = curl_init('https://jethro.au/api/shorten');

@@ -1,12 +1,20 @@
 /**
- * Integration tests for the URL Shortener Worker
- * Run with: npx cf dev (in one terminal), then node test_worker.js
+ * Tests for the URL Shortener Worker, in two parts:
  *
- * Or run tests against your deployed worker:
+ * 1. Sign-in flows, in-process: worker.js runs in Node with a fake KV
+ *    namespace and faked Resend and GitHub APIs, so the signup and consent
+ *    flows (magic links, OAuth, consent tickets) run end to end without
+ *    secrets or a server.
+ * 2. HTTP integration tests. Run with: npx cf dev (in one terminal), then
+ *    node test_worker.js
+ *
+ * Or run the HTTP tests against your deployed worker:
  *   BASE_URL=https://yourdomain.com API_KEY=your-key node test_worker.js
  */
 
-const BASE_URL = process.env.BASE_URL || 'http://localhost:8787';
+import worker, { SERVICES } from './worker.js';
+
+const BASE_URL = process.env.BASE_URL || 'http://localhost:5173';
 const API_KEY = process.env.API_KEY || 'test-key';
 
 const headers = {
@@ -282,7 +290,413 @@ async function runTests() {
     assert(data.permanentlyDeleted === true, 'permanentlyDeleted should be true');
   });
 
-  // Summary
+  // Services and consent
+  console.log('\n🤝 Services and consent');
+  const bearer = (token) => ({ 'Content-Type': 'application/json', Authorization: `Bearer ${token}` });
+  const validate = async (token) => (await fetch(`${BASE_URL}/api/validate`, { headers: bearer(token) })).json();
+  const authorize = (token, service) => fetch(`${BASE_URL}/api/authorize?service=${service}`, { headers: bearer(token) });
+  const putConsent = (id, service, body, token = API_KEY) => fetch(`${BASE_URL}/api/keys/${id}/consents/${service}`, {
+    method: 'PUT', headers: bearer(token), body: JSON.stringify(body),
+  });
+  let ck = null; // { id, token } of a create key made for these tests
+
+  await test('POST /api/keys creates a create key (no consents)', async () => {
+    const resp = await fetch(`${BASE_URL}/api/keys`, {
+      method: 'POST', headers, body: JSON.stringify({ type: 'create', label: 'consent-test' }),
+    });
+    assert(resp.status === 201, `Expected 201, got ${resp.status}`);
+    ck = await resp.json();
+  });
+
+  try {
+    await test('GET /api/validate lists every service, unconsented, for a new create key', async () => {
+      const data = await validate(ck.token);
+      for (const id of Object.keys(SERVICES)) {
+        const s = data.services?.[id];
+        assert(s, `services.${id} missing`);
+        assert(s.name === SERVICES[id].name, `services.${id}.name`);
+        assert(s.consented === false && s.accepted === false && s.current === false, `services.${id} flags`);
+        assert(s.version === null && s.by === null && s.at === null, `services.${id} version/by/at`);
+        assert(s.privacyUrl.endsWith(SERVICES[id].privacyPath), `services.${id}.privacyUrl`);
+      }
+    });
+
+    await test('GET /api/validate reports admin keys as consented to every service', async () => {
+      const data = await validate(API_KEY);
+      for (const id of Object.keys(SERVICES)) {
+        const s = data.services[id];
+        assert(s.consented && s.accepted && s.current && s.version === null, `services.${id}: ${JSON.stringify(s)}`);
+      }
+    });
+
+    await test('GET /api/authorize: 400 unknown service, 401 bad key, 200 admin', async () => {
+      assert((await authorize(ck.token, 'nope')).status === 400, 'unknown service');
+      assert((await authorize(ck.token, '__proto__')).status === 400, '__proto__ is not a service');
+      const bad = await authorize('cus_bad', 'sms-shortener');
+      assert(bad.status === 401, `bad key: ${bad.status}`);
+      assert((await bad.json()).error === 'Unauthorized', 'bad key body');
+      const admin = await authorize(API_KEY, 'sms-shortener');
+      assert(admin.status === 200, `admin: ${admin.status}`);
+      assert((await admin.json()).authorized === true, 'admin authorized');
+    });
+
+    await test('GET /api/authorize → 403 consent_required without consent', async () => {
+      const resp = await authorize(ck.token, 'sms-shortener');
+      assert(resp.status === 403, `Expected 403, got ${resp.status}`);
+      const data = await resp.json();
+      assert(data.error === 'consent_required', `error ${data.error}`);
+      assert(data.service === 'sms-shortener', `service ${data.service}`);
+      assert(data.privacyUrl.endsWith('/sms-shortener/privacy'), `privacyUrl ${data.privacyUrl}`);
+    });
+
+    await test('POST /api/shorten → 403 consent_required for a create key without url-shortener consent', async () => {
+      const resp = await fetch(`${BASE_URL}/api/shorten`, {
+        method: 'POST', headers: bearer(ck.token), body: JSON.stringify({ url: 'https://example.com/consent-test' }),
+      });
+      assert(resp.status === 403, `Expected 403, got ${resp.status}`);
+      const data = await resp.json();
+      assert(data.error === 'consent_required' && data.service === 'url-shortener', JSON.stringify(data));
+      assert(data.privacyUrl.endsWith('/url-shortener/privacy'), `privacyUrl ${data.privacyUrl}`);
+    });
+
+    await test('PUT /api/keys/{id}/consents/{service} is admin-only and checks its input', async () => {
+      assert((await putConsent(ck.id, 'sms-shortener', { by: 'x@example.com' }, ck.token)).status === 403, 'create key');
+      assert((await putConsent(ck.id, 'sms-shortener', {})).status === 400, 'missing by');
+      assert((await putConsent(ck.id, 'sms-shortener', { by: 'x@example.com', version: 'soon' })).status === 400, 'bad version');
+      assert((await putConsent(ck.id, 'nope', { by: 'x@example.com' })).status === 400, 'unknown service');
+      assert((await putConsent('no-such-key', 'sms-shortener', { by: 'x@example.com' })).status === 404, 'unknown key');
+    });
+
+    await test('a consent older than minPolicyVersion → 403 consent_outdated', async () => {
+      const put = await putConsent(ck.id, 'sms-shortener', { by: 'tester@example.com', version: '2000-01-01' });
+      assert(put.status === 200, `PUT: ${put.status}`);
+      const resp = await authorize(ck.token, 'sms-shortener');
+      assert(resp.status === 403, `Expected 403, got ${resp.status}`);
+      assert((await resp.json()).error === 'consent_outdated', 'consent_outdated');
+      const s = (await validate(ck.token)).services['sms-shortener'];
+      assert(s.consented && !s.accepted && !s.current && s.version === '2000-01-01', JSON.stringify(s));
+    });
+
+    await test('a current consent → GET /api/authorize 200 with the keyId', async () => {
+      assert((await putConsent(ck.id, 'sms-shortener', { by: 'tester@example.com' })).status === 200, 'PUT');
+      const resp = await authorize(ck.token, 'sms-shortener');
+      assert(resp.status === 200, `Expected 200, got ${resp.status}`);
+      const data = await resp.json();
+      assert(data.authorized === true && data.keyId === ck.id && data.service === 'sms-shortener', JSON.stringify(data));
+      const s = (await validate(ck.token)).services['sms-shortener'];
+      assert(s.consented && s.accepted && s.current, JSON.stringify(s));
+      assert(s.version === SERVICES['sms-shortener'].policyVersion && s.by === 'tester@example.com' && s.at, JSON.stringify(s));
+      assert((await authorize(ck.token, 'url-shortener')).status === 403, 'consents are per service');
+    });
+
+    await test('POST /api/shorten succeeds once the url-shortener consent is given', async () => {
+      assert((await putConsent(ck.id, 'url-shortener', { by: 'tester@example.com' })).status === 200, 'PUT');
+      const code = `${testCode}-consent`;
+      const resp = await fetch(`${BASE_URL}/api/shorten`, {
+        method: 'POST', headers: bearer(ck.token), body: JSON.stringify({ url: 'https://example.com/consent-test', code }),
+      });
+      assert(resp.status === 200, `Expected 200, got ${resp.status}`);
+      await fetch(`${BASE_URL}/api/urls/${code}`, { method: 'DELETE', headers });
+      await fetch(`${BASE_URL}/api/urls/${code}/permanent`, { method: 'DELETE', headers });
+    });
+
+    let consentUrl = null;
+    await test('POST /api/consents → 201 with a consent URL', async () => {
+      const resp = await fetch(`${BASE_URL}/api/consents`, {
+        method: 'POST', headers: bearer(ck.token),
+        body: JSON.stringify({ service: 'sms-shortener', redirect: 'https://jethro.example/admin' }),
+      });
+      assert(resp.status === 201, `Expected 201, got ${resp.status}`);
+      const data = await resp.json();
+      assert(/\/consent\?ticket=[0-9a-f-]{36}$/.test(data.consentUrl), `consentUrl ${data.consentUrl}`);
+      assert(data.expiresIn === 600, `expiresIn ${data.expiresIn}`);
+      consentUrl = data.consentUrl;
+    });
+
+    await test('POST /api/consents rejects an unknown service, a bad redirect and a bad key', async () => {
+      const post = (body, token = ck.token) => fetch(`${BASE_URL}/api/consents`, {
+        method: 'POST', headers: bearer(token), body: JSON.stringify(body),
+      });
+      assert((await post({ service: 'nope' })).status === 400, 'unknown service');
+      assert((await post({ service: 'sms-shortener', redirect: 'javascript:alert(1)' })).status === 400, 'bad redirect');
+      assert((await post({ service: 'sms-shortener' }, 'cus_bad')).status === 401, 'bad key');
+    });
+
+    await test('GET /consent names the service (501 when no sign-in is configured); unknown ticket → 410', async () => {
+      const resp = await fetch(consentUrl.replace(/^https?:\/\/[^/]+/, BASE_URL));
+      assert([200, 501].includes(resp.status), `Expected 200 or 501, got ${resp.status}`);
+      if (resp.status === 200) {
+        const html = await resp.text();
+        assert(html.includes(SERVICES['sms-shortener'].name) && html.includes('name="agree"'), 'page content');
+      }
+      const gone = await fetch(`${BASE_URL}/consent?ticket=00000000-0000-0000-0000-000000000000`);
+      assert(gone.status === 410, `Expected 410, got ${gone.status}`);
+    });
+
+    await test('DELETE /api/consents/{service} withdraws consent, idempotently', async () => {
+      for (let i = 0; i < 2; i++) {
+        const resp = await fetch(`${BASE_URL}/api/consents/sms-shortener`, { method: 'DELETE', headers: bearer(ck.token) });
+        assert(resp.status === 200, `Expected 200, got ${resp.status}`);
+        const data = await resp.json();
+        assert(data.withdrawn === true && data.service === 'sms-shortener', JSON.stringify(data));
+      }
+      const resp = await authorize(ck.token, 'sms-shortener');
+      assert(resp.status === 403 && (await resp.json()).error === 'consent_required', 'refused after withdrawal');
+      assert((await authorize(ck.token, 'url-shortener')).status === 200, 'other consents kept');
+    });
+
+    await test('DELETE /api/consents/{service} rejects an unknown service and a bad key', async () => {
+      assert((await fetch(`${BASE_URL}/api/consents/nope`, { method: 'DELETE', headers: bearer(ck.token) })).status === 400, 'unknown');
+      assert((await fetch(`${BASE_URL}/api/consents/sms-shortener`, { method: 'DELETE', headers: bearer('cus_bad') })).status === 401, 'bad key');
+    });
+  } finally {
+    if (ck) await fetch(`${BASE_URL}/api/keys/${ck.id}`, { method: 'DELETE', headers });
+  }
+
+  console.log('\n📄 Pages');
+  await test('GET /url-shortener/privacy is dated by the url-shortener policyVersion', async () => {
+    const resp = await fetch(`${BASE_URL}/url-shortener/privacy`);
+    assert(resp.status === 200, `Expected 200, got ${resp.status}`);
+    const html = await resp.text();
+    const [y, m, d] = SERVICES['url-shortener'].policyVersion.split('-').map(Number);
+    const month = new Date(Date.UTC(y, m - 1, d)).toLocaleString('en-AU', { month: 'long', timeZone: 'UTC' });
+    assert(html.includes(`Last updated ${d} ${month} ${y}.`), 'last-updated date');
+  });
+
+  await test('GET / names both services and links their privacy pages', async () => {
+    const html = await (await fetch(`${BASE_URL}/`)).text();
+    for (const s of Object.values(SERVICES)) {
+      assert(html.includes(s.name) && html.includes(`href="${s.privacyPath}"`), `mentions ${s.name}`);
+    }
+  });
+}
+
+/** Fake Workers KV namespace (no TTLs). */
+function fakeKv() {
+  const data = new Map();
+  return {
+    data,
+    async get(key, opts) {
+      if (!data.has(key)) return null;
+      return opts?.type === 'json' ? JSON.parse(data.get(key)) : data.get(key);
+    },
+    async put(key, value) { data.set(key, String(value)); },
+    async delete(key) { data.delete(key); },
+    async list({ prefix = '' } = {}) {
+      return { keys: [...data.keys()].filter((k) => k.startsWith(prefix)).map((name) => ({ name })), list_complete: true };
+    },
+  };
+}
+
+/**
+ * Signup and consent flows, run in-process against fake KV, Resend and GitHub.
+ */
+async function runFlowTests() {
+  console.log('\n🔐 Sign-in flows (in-process, fake KV, email and GitHub)\n');
+
+  const env = {
+    URL_MAPPINGS: fakeKv(),
+    API_KEY: 'admin-secret',
+    EMAIL_API_KEY: 'resend-test',
+    EMAIL_FROM: 'noreply@example.com',
+    GITHUB_CLIENT_ID: 'gh-client',
+    GITHUB_CLIENT_SECRET: 'gh-secret',
+  };
+  const emails = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url === 'https://api.resend.com/emails') {
+      emails.push(JSON.parse(init.body));
+      return Response.json({ id: 'email-1' });
+    }
+    if (url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'gh-token' });
+    if (url === 'https://api.github.com/user') return Response.json({ id: 4242 });
+    if (url === 'https://api.github.com/user/emails') {
+      return Response.json([{ email: 'gh-user@example.com', primary: true, verified: true }]);
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const ORIGIN = 'https://jethro.au';
+  const RETURN = 'https://jethro.example/admin?view=config';
+  const call = (path, { method = 'GET', form, json, token, cookie } = {}) => {
+    const h = {};
+    if (token) h.Authorization = `Bearer ${token}`;
+    if (cookie) h.Cookie = cookie;
+    if (json) h['Content-Type'] = 'application/json';
+    const body = form ? new URLSearchParams(form) : json ? JSON.stringify(json) : undefined;
+    return worker.fetch(new Request(ORIGIN + path, { method, headers: h, body, redirect: 'manual' }), env, {});
+  };
+  const query = (resp) => new URL(resp.headers.get('Location')).searchParams;
+  const validate = async (token) => (await call('/api/validate', { token })).json();
+  /** Path of the magic link in the latest email. */
+  const lastLink = () => {
+    const m = emails.at(-1).text.match(/https:\/\/jethro\.au(\/auth\/email\/callback\?token=[\w-]+)/);
+    assert(m, 'email contains a magic link');
+    return m[1];
+  };
+  /** Complete a GitHub sign-in started by GET `loginPath`. */
+  const githubSignIn = async (loginPath) => {
+    const login = await call(loginPath);
+    assert(login.status === 302, `login: expected 302, got ${login.status}`);
+    const state = new URL(login.headers.get('Location')).searchParams.get('state');
+    const cookie = login.headers.get('Set-Cookie').split(';')[0];
+    return call(`/auth/github/callback?state=${state}&code=c`, { cookie });
+  };
+  const smsAck = SERVICES['sms-shortener'].acknowledgement;
+
+  try {
+    await test('signup page for a service shows its acknowledgement, privacy link and a required agree box', async () => {
+      const resp = await call(`/signup?service=sms-shortener&campaign=Example%20Church&redirect=${encodeURIComponent(RETURN)}`);
+      assert(resp.status === 200, `Expected 200, got ${resp.status}`);
+      const html = await resp.text();
+      assert(html.includes(smsAck), 'acknowledgement');
+      assert(html.includes(`${ORIGIN}/sms-shortener/privacy`), 'privacy link');
+      assert(html.includes('name="agree" value="1" required'), 'required agree box');
+      assert(html.includes('I agree to this on behalf of Example Church'), 'agree label names the organisation');
+      assert(html.includes('formaction="/auth/github/login"'), 'GitHub button submits the same form');
+    });
+
+    await test('plain signup page has no agree box; unknown services are ignored', async () => {
+      const html = await (await call('/signup?service=nope')).text();
+      assert(!html.includes('name="agree"'), 'no agree box');
+      assert(!html.includes('name="service"'), 'unknown service not carried');
+    });
+
+    await test('a service signup without agree is refused by the server (email and OAuth)', async () => {
+      const sent = emails.length;
+      const form = { email: 'admin@example.com', service: 'sms-shortener', redirect: RETURN };
+      assert((await call('/signup', { method: 'POST', form })).status === 400, 'email POST');
+      assert((await call('/auth/github/login?service=sms-shortener')).status === 400, 'OAuth login');
+      assert(emails.length === sent, 'no email sent');
+    });
+
+    let smsKey;
+    await test('email signup with agree mints a key with that consent and redirects with sh_consented', async () => {
+      const form = { email: 'admin@example.com', service: 'sms-shortener', campaign: 'Example Church', redirect: RETURN, agree: '1' };
+      assert((await call('/signup', { method: 'POST', form })).status === 200, 'email sent');
+      assert(emails.at(-1).text.includes(smsAck) && emails.at(-1).text.includes('/sms-shortener/privacy'), 'email repeats the agreement');
+      const resp = await call(lastLink());
+      assert(resp.status === 302, `Expected 302, got ${resp.status}`);
+      const q = query(resp);
+      assert(resp.headers.get('Location').startsWith('https://jethro.example/admin?view=config&'), 'returns to the app');
+      assert(q.get('sh_apikey').startsWith('cus_') && q.get('sh_email') === 'admin@example.com', 'key and email');
+      assert(q.get('sh_consented') === 'sms-shortener' && !q.has('sh_replaced'), q.toString());
+      smsKey = q.get('sh_apikey');
+      const data = await validate(smsKey);
+      assert(data.createdByCampaign === 'Example Church', 'campaign');
+      const s = data.services['sms-shortener'];
+      assert(s.consented && s.current && s.by === 'admin@example.com', JSON.stringify(s));
+      assert(!data.services['url-shortener'].consented, 'only the agreed service');
+      assert((await call('/api/authorize?service=sms-shortener', { token: smsKey })).status === 200, 'authorized');
+    });
+
+    await test('a magic link works once', async () => {
+      await call('/signup', { method: 'POST', form: { email: 'once@example.com' } });
+      const link = lastLink();
+      assert((await call(link)).status === 200, 'first use shows the key');
+      assert((await call(link)).status === 410, 'second use');
+    });
+
+    await test('plain re-signup replaces the key, keeps its consents, and adds no sh_consented', async () => {
+      await call('/signup', { method: 'POST', form: { email: 'admin@example.com', redirect: RETURN } });
+      const resp = await call(lastLink());
+      const q = query(resp);
+      assert(q.get('sh_replaced') === '1' && !q.has('sh_consented'), q.toString());
+      assert((await call('/api/validate', { token: smsKey })).status === 401, 'old key revoked');
+      smsKey = q.get('sh_apikey');
+      assert((await validate(smsKey)).services['sms-shortener'].consented, 'consent carried over');
+    });
+
+    let ghKey;
+    await test('OAuth signup carries the service and agreement through the state cookie', async () => {
+      const resp = await githubSignIn(`/auth/github/login?service=url-shortener&agree=1&campaign=Example%20Church&redirect=${encodeURIComponent(RETURN)}`);
+      assert(resp.status === 302, `Expected 302, got ${resp.status}`);
+      const q = query(resp);
+      assert(q.get('sh_consented') === 'url-shortener' && q.get('sh_email') === 'gh-user@example.com', q.toString());
+      assert(resp.headers.get('Set-Cookie').includes('Max-Age=0'), 'state cookie cleared');
+      ghKey = q.get('sh_apikey');
+      const s = (await validate(ghKey)).services['url-shortener'];
+      assert(s.current && s.by === 'gh-user@example.com', JSON.stringify(s));
+    });
+
+    /** Start consent to `service` for `token`'s key; returns the ticket query, '?ticket=…'. */
+    const newTicket = async (token, service, redirect) => {
+      const resp = await call('/api/consents', { method: 'POST', token, json: { service, ...(redirect ? { redirect } : {}) } });
+      assert(resp.status === 201, `POST /api/consents: expected 201, got ${resp.status}`);
+      return new URL((await resp.json()).consentUrl).search;
+    };
+
+    let ticket;
+    await test('consent page names the service and organisation and requires agreement', async () => {
+      ticket = await newTicket(ghKey, 'sms-shortener', RETURN);
+      const resp = await call(`/consent${ticket}`);
+      assert(resp.status === 200, `Expected 200, got ${resp.status}`);
+      const html = await resp.text();
+      assert(html.includes(SERVICES['sms-shortener'].name) && html.includes(smsAck), 'service and acknowledgement');
+      assert(html.includes(`${ORIGIN}/sms-shortener/privacy`), 'privacy link');
+      assert(html.includes('registered to <strong>Example Church</strong>'), 'organisation');
+      assert(html.includes('name="agree" value="1" required') && html.includes('on behalf of Example Church'), 'agree box');
+      assert(html.includes('Sign in with GitHub') && html.includes('name="email"'), 'sign-in options');
+    });
+
+    await test('a consent sign-in without agree is refused by the server (email and OAuth)', async () => {
+      const id = new URLSearchParams(ticket).get('ticket');
+      assert((await call('/consent', { method: 'POST', form: { ticket: id, email: 'staff@example.com' } })).status === 400, 'email');
+      assert((await call(`/auth/github/login${ticket}`)).status === 400, 'OAuth');
+    });
+
+    let secondLink;
+    await test('email consent records who agreed and redirects with sh_consented', async () => {
+      const form = { ticket: new URLSearchParams(ticket).get('ticket'), email: 'staff@example.com', agree: '1' };
+      assert((await call('/consent', { method: 'POST', form })).status === 200, 'first email');
+      const firstLink = lastLink();
+      assert(emails.at(-1).subject.startsWith('Confirm') && emails.at(-1).text.includes(smsAck), 'email says what is agreed');
+      assert((await call('/consent', { method: 'POST', form })).status === 200, 'second email');
+      secondLink = lastLink();
+      const resp = await call(firstLink);
+      assert(resp.status === 302, `Expected 302, got ${resp.status}`);
+      assert(resp.headers.get('Location').startsWith(`${RETURN}&`), 'returns to the ticket redirect');
+      const q = query(resp);
+      assert(q.get('sh_consented') === 'sms-shortener' && !q.has('sh_apikey'), q.toString());
+      const data = await validate(ghKey);
+      assert(data.services['sms-shortener'].current && data.services['sms-shortener'].by === 'staff@example.com', 'consent by the signer');
+      assert(data.services['url-shortener'].by === 'gh-user@example.com', 'other consent unchanged');
+    });
+
+    await test('a consent ticket is single use', async () => {
+      assert((await call(secondLink)).status === 410, 'another magic link for the used ticket');
+      assert((await call(`/consent${ticket}`)).status === 410, 'consent page');
+      assert((await call(`/auth/github/login${ticket}&agree=1`)).status === 410, 'OAuth login');
+    });
+
+    await test('OAuth consent without a redirect shows a confirmation page', async () => {
+      const t = await newTicket(smsKey, 'url-shortener');
+      const resp = await githubSignIn(`/auth/github/login${t}&agree=1`);
+      assert(resp.status === 200, `Expected 200, got ${resp.status}`);
+      assert((await resp.text()).includes('is now'), 'confirmation');
+      assert((await validate(smsKey)).services['url-shortener'].by === 'gh-user@example.com', 'consent recorded');
+    });
+
+    await test('a consent ticket for a revoked key → 410', async () => {
+      const t = await newTicket(smsKey, 'sms-shortener');
+      assert((await call('/api/keys/mine', { method: 'DELETE', token: smsKey })).status === 200, 'deregistered');
+      assert((await call(`/consent${t}`)).status === 410, 'consent page');
+    });
+
+    await test('POST /api/consents with the bootstrap key → 400', async () => {
+      const resp = await call('/api/consents', { method: 'POST', token: env.API_KEY, json: { service: 'sms-shortener' } });
+      assert(resp.status === 400, `Expected 400, got ${resp.status}`);
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+async function main() {
+  await runFlowTests();
+  await runTests();
   console.log(`\n${'─'.repeat(40)}`);
   console.log(`Results: ${passed} passed, ${failed} failed`);
   if (failed > 0) {
@@ -290,7 +704,7 @@ async function runTests() {
   }
 }
 
-runTests().catch((err) => {
+main().catch((err) => {
   console.error('Test runner error:', err);
   process.exit(1);
 });

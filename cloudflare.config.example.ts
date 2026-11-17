@@ -47,6 +47,22 @@ export default defineConfig({
 				zone: "yourdomain.com",
 			}),
 			triggers.fetch({
+				pattern: "yourdomain.com/consent*",
+				zone: "yourdomain.com",
+			}),
+			triggers.fetch({
+				pattern: "yourdomain.com/api/authorize*",
+				zone: "yourdomain.com",
+			}),
+			triggers.fetch({
+				pattern: "yourdomain.com/api/consents*",
+				zone: "yourdomain.com",
+			}),
+			triggers.fetch({
+				pattern: "yourdomain.com/url-shortener/*",
+				zone: "yourdomain.com",
+			}),
+			triggers.fetch({
 				pattern: "yourdomain.com/",
 				zone: "yourdomain.com",
 			}),
@@ -55,6 +71,9 @@ export default defineConfig({
 			URL_MAPPINGS: bindings.kv({
 				id: "YOUR_KV_NAMESPACE_ID",
 			}),
+			// Named on the privacy page (/url-shortener/privacy) and the landing page.
+			PRIVACY_OPERATOR: bindings.text("Your organisation name"),
+			PRIVACY_CONTACT: bindings.text("privacy@yourdomain.com"),
 			// Declare secrets here so `cf dev` loads their local values from
 			// .dev.vars (see README "Tests"); production values come from
 			// `cf workers secrets update`, which this does not override.

@@ -5,14 +5,14 @@ require_once __DIR__ . '/UrlShortener.php';
 
 $opts = getopt('', ['apitoken:', 'campaign:']);
 
-$apiToken = $opts['apitoken'] ?? getenv('URLSHORTENER_API_KEY') ?: '';
+$apiToken = $opts['apitoken'] ?? getenv('JETHROAU_API_KEY') ?: '';
 $campaign = $opts['campaign'] ?? null; // null = use default (API key prefix)
 
 define('URLSHORTENER', getenv('URLSHORTENER') ?: 'jethroau');
-define('URLSHORTENER_API_KEY', $apiToken);
+define('JETHROAU_API_KEY', $apiToken);
 
 if ($apiToken === '') {
-    fwrite(STDERR, "Error: no API key. Set URLSHORTENER_API_KEY env var or pass --apitoken.\n");
+    fwrite(STDERR, "Error: no API key. Set JETHROAU_API_KEY env var or pass --apitoken.\n");
     exit(1);
 }
 

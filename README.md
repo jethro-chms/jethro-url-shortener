@@ -1,6 +1,6 @@
 # jethro.au URL Shortener
 
-A heavily modified fork of [IAMDevBox/cloudflare-url-shortener](https://github.com/IAMDevBox/cloudflare-url-shortener) deployed at [jethro.au](https://jethro.au), used for shortening URLs in Jethro SMSes.
+A heavily modified fork of [IAMDevBox/cloudflare-url-shortener](https://github.com/IAMDevBox/cloudflare-url-shortener) deployed at [jethro.au](https://jethro.au), used for shortening URLs in Jethro SMSes. It is also the jethro.au account: it issues the one API key each Jethro installation uses for every jethro.au service, and records the organisation's consent to each service (see [Services and consent](#services-and-consent)).
 
 A production-ready, self-hosted URL shortener built with **Cloudflare Workers** and **KV storage**. Zero cost, global edge performance, and full CRUD admin API. Click counts come from Cloudflare zone analytics.
 
@@ -15,6 +15,8 @@ A production-ready, self-hosted URL shortener built with **Cloudflare Workers** 
 - **Full CRUD API** — create, list, update, soft-delete, restore, permanent-delete
 - **Multi-key authentication** — admin and create-only API keys with full CRUD management, revocable without rotating the bootstrap key
 - **Self-service signup** — anyone can obtain a create-only key via Google, GitHub, or email magic link at `/signup`
+- **Per-service consent** — each jethro.au service (this URL shortener, the [SMS shortener](https://github.com/jethro-chms/jethro-sms-shortener)) works for a key only once someone has agreed, on behalf of the organisation, to its data handling; recorded with who, when and which privacy-policy version
+- **Privacy page** — `/url-shortener/privacy` describes what this service stores and who can see it
 - **Campaign attribution** — keys created via the signup flow are stamped with a campaign id, and every URL shortened with that key inherits it — so you can trace which organisation created which link
 - **Privacy-preserving deregistration** — self-service key revocation (`DELETE /api/keys/mine`) scrubs owner identity and campaign from all URLs created by that key, while the shortened URLs themselves keep working
 - **Bot protection** — per-URL `block_bots` flag puts a Cloudflare Turnstile check in front of the redirect
@@ -88,9 +90,26 @@ All API keys (bootstrap, admin-created, and self-service) are stored hashed: `to
 
 Key holders can deregister themselves via `DELETE /api/keys/mine`, which revokes the key and scrubs their `createdBy` / `createdByCampaign` attribution from any URLs they created. The shortened URLs themselves are untouched — they continue to work, just anonymously.
 
-Keys work for every jethro.au service, including the [SMS shortener](https://github.com/jethro-chms/jethro-sms-shortener), which reads this Worker's key store. A signup for another service passes `?service=<name>` (currently `sms-shortener`; see `SIGNUP_SERVICES` in `worker.js`): the signup page and magic-link email then name that service and ask the signer to acknowledge its data handling, linking its privacy policy (e.g. `/sms-shortener/privacy`). Unknown values are ignored.
-
 Setup is optional — see [step 5 of the Quick Start](#5-optional-enable-self-service-api-key-signup). Providers with no client ID configured are hidden from `/signup`; with neither configured the page returns 501 and the feature is effectively off.
+
+### Services and consent
+
+One key serves an installation for every jethro.au service, but each service also needs the organisation's **consent** to its data handling, given by a signed-in person and recorded on the key. The services are listed in `SERVICES` in `worker.js`:
+
+| Service id | Privacy page | Checked by |
+|------------|--------------|------------|
+| `url-shortener` | `/url-shortener/privacy` (`privacy.js`) | `POST /api/shorten` |
+| `sms-shortener` | `/sms-shortener/privacy` (served by the SMS shortener Worker) | the SMS shortener, through `GET /api/authorize` over a service binding |
+
+A consent is stored on the key record as `consents[serviceId] = { version, by, byOwner, at }`: the privacy-policy version agreed to, the signer's email and sign-in identity, and when. Each service has a `policyVersion` — the "last updated" date of its privacy page, which must change together with the page — and a `minPolicyVersion`. A consent is **accepted** (the service works) while its version is at least `minPolicyVersion`, and **current** when it equals `policyVersion`. Raise `minPolicyVersion` only for material changes: every organisation must then agree again. Admin keys need no consent.
+
+Consent is given:
+
+- **At signup**, with `?service=<id>` on `/signup`: the page states what the service shares, links its privacy page, and requires an **I agree to this on behalf of …** checkbox. The worker enforces the checkbox for email and OAuth sign-ins, mints the key with that consent, and adds `sh_consented=<id>` to the redirect back.
+- **Later**, for an existing key: `POST /api/consents` returns a single-use consent URL (10 minutes) whose page names the service and the organisation the key is registered to, and asks someone to tick **I agree** and sign in. The consent is then recorded with their identity and the browser is redirected back with `sh_consented=<id>`.
+- **By an operator**, with `PUT /api/keys/{id}/consents/{service}` (admin only), for agreement given another way, e.g. in writing.
+
+Consents are kept until withdrawn (`DELETE /api/consents/{service}`) or the key is revoked. Signing in again, which replaces the key, carries its consents over. A service refuses a create key without an accepted consent with 403 `{ "error": "consent_required" | "consent_outdated", "service", "privacyUrl" }`; `GET /api/validate` reports every service's status. See [PHP_INTEGRATION.md](PHP_INTEGRATION.md) for the flow from Jethro's side.
 
 ### Devbox tooling
 
@@ -121,7 +140,7 @@ Jethro is PHP, so we provide a PHP library for interacting with the shortener.
 require_once 'src/php/UrlShortener.php';
 
 define('URLSHORTENER', 'jethroau');
-define('URLSHORTENER_API_KEY', 'cus_...');
+define('JETHROAU_API_KEY', 'cus_...');   // the installation's jethro.au key, shared by all jethro.au services
 
 $s = getUrlShortener();
 // Short codes are salted with the API key prefix, so each installation
@@ -139,9 +158,10 @@ $s->shorten('https://example.com/long', campaign: 'email');
 $s->shorten('https://example.com/long', campaign: 'sms', blockBots: true);
 $s->previewShorten('https://example.com/long', campaign: 'sms', blockBots: true);
 
-// Build a signup URL that stamps the key with a campaign id:
-$signupUrl = $s->getSignupUrl('https://my.app/callback', 'my-organisation');
-// → https://jethro.au/signup?redirect=...&campaign=my-organisation
+// Build a signup URL that stamps the key with a campaign id (the organisation)
+// and records its consent to the URL shortener:
+$signupUrl = $s->getSignupUrl('https://my.app/callback', 'my-organisation', 'url-shortener');
+// → https://jethro.au/signup?redirect=...&campaign=my-organisation&service=url-shortener
 ```
 
 `src/php/shorten.php` — CLI frontend using the library:
@@ -155,7 +175,7 @@ devbox run -- php src/php/shorten.php https://example.com/my-post twitter
 
 `devbox run test` — PHP functional test against the live API: predicts a short code via `previewShorten()`, creates it via the live API, confirms the codes match, fetches the short URL, and validates the 302 redirect to the original target.
 
-`node test_worker.js` — Worker HTTP integration suite (29 tests). Point it at a deployed worker, or run the worker locally:
+`node test_worker.js` — Worker tests (59). The first 14 run `worker.js` in-process with a fake KV namespace and faked Resend and GitHub APIs, covering signup and consent end to end: the agree checkbox enforced by the server, consents minted at signup and carried over on re-signup, consent tickets through email and OAuth sign-in, and tickets being single use. The other 45 are an HTTP integration suite (services and consent through the admin API, `/api/authorize`, `/api/shorten` with and without consent, `/api/consents`, the privacy and landing pages). Point it at a deployed worker, or run the worker locally:
 
 ```bash
 # .dev.vars holds local values for secrets declared in cloudflare.config.ts
@@ -208,7 +228,9 @@ triggers.fetch({ pattern: "yourdomain.com/s/*", zone: "yourdomain.com" }),
 URL_MAPPINGS: bindings.kv({ id: "YOUR_KV_NAMESPACE_ID" }), // from step 2
 ```
 
-The example config also routes the zone root (`yourdomain.com/`) to the worker's landing page. If you upgraded from an earlier version, add that trigger too — without it requests to `/` fall through to the origin and hang:
+The example config also routes the zone root (`yourdomain.com/`) to the worker's landing page, plus `/consent*`, `/api/authorize*`, `/api/consents*` and `/url-shortener/*` for the consent flow and the privacy page. If you upgraded from an earlier version, add those triggers too — without them the requests fall through to the origin and hang.
+
+Set `PRIVACY_OPERATOR` and `PRIVACY_CONTACT`: they name who runs the service, and how to reach them, on the privacy page and landing page.
 
 ### 4. Set your admin API key
 
@@ -335,7 +357,7 @@ Visit `https://yourdomain.com/signup` to test: sign in, and your API key is show
 
 ## API Reference
 
-All write endpoints require `Authorization: Bearer YOUR_API_KEY` (admin or create, depending on the endpoint).
+All write endpoints require `Authorization: Bearer YOUR_API_KEY` (admin or create, depending on the endpoint). Create keys can only use a service whose consent they hold (see [Services and consent](#services-and-consent)).
 
 ### Create a short URL
 
@@ -362,6 +384,8 @@ Response:
 ```
 
 If the same URL + campaign was already created, the response includes `"existing": true` and returns the existing short code (idempotent). `block_bots` is part of the identity: protected and unprotected links to the same URL get different codes (hash of `url::campaign::block_bots`).
+
+Create keys need an accepted `url-shortener` consent; without one the response is 403 `{"error": "consent_required", "service": "url-shortener", "privacyUrl": "https://yourdomain.com/url-shortener/privacy"}` (`consent_outdated` for a consent to a superseded policy version).
 
 `block_bots` links: `GET /s/{code}` returns a Turnstile page; the widget POSTs its token to `/s/{code}`, the worker verifies it with Cloudflare's siteverify API, then 303-redirects and sets a signed `bot_pass` cookie (30 minutes, all `/s/` links) so the visitor isn't challenged again. These responses are never cached. CLI: `devbox run shorten-protected <url> [campaign]`.
 
@@ -524,7 +548,56 @@ curl -X DELETE https://yourdomain.com/api/keys/mine \
   -H "Authorization: Bearer YOUR_API_KEY"
 ```
 
-Any valid key can revoke itself. This deletes the key from KV and scrubs the owner's identity and campaign from any URLs they created — the shortened URLs themselves continue to work.
+Any valid key can revoke itself. This deletes the key (with its consents) from KV and scrubs the owner's identity and campaign from any URLs they created — the shortened URLs themselves continue to work.
+
+### Validate a key
+
+```bash
+curl https://yourdomain.com/api/validate \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+Any valid key. Returns `valid`, `type`, `label`, `created`, `tokenPrefix`, the owner fields and `createdByCampaign` when set, and `services`: for every service, `{ name, consented, accepted, current, version, by, at, privacyUrl }`. Admin keys report `consented`/`accepted`/`current` true and `version`/`by`/`at` null. See [PHP_INTEGRATION.md](PHP_INTEGRATION.md#step-4--check-the-key-and-its-consents) for an example.
+
+### Authorize a key for a service
+
+```bash
+curl "https://yourdomain.com/api/authorize?service=sms-shortener" \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+For other jethro.au Workers (through a service binding). 200 `{"authorized": true, "keyId": "…", "service": "sms-shortener"}` (`keyId` is null for the bootstrap key); 401 `{"error": "Unauthorized"}`; 403 `{"error": "consent_required" | "consent_outdated", "service", "privacyUrl"}`; 400 for an unknown service. Admin keys need no consent.
+
+### Start consent to a service
+
+```bash
+curl -X POST https://yourdomain.com/api/consents \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"service": "sms-shortener", "redirect": "https://jethro.example/admin"}'
+```
+
+201 `{"consentUrl": "https://yourdomain.com/consent?ticket=…", "expiresIn": 600}`. Send a person to `consentUrl`: they tick **I agree** and sign in, the consent is recorded, and they are redirected to `redirect` (optional; absolute http(s)) with `sh_consented=sms-shortener`, or shown a confirmation page. The ticket (`ct:{uuid}` in KV) works once; an expired or used ticket, or a revoked key, gives a 410 page. 400 for an unknown service, a bad `redirect` or the bootstrap key; 401 for a bad key.
+
+### Withdraw consent to a service
+
+```bash
+curl -X DELETE https://yourdomain.com/api/consents/sms-shortener \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+200 `{"withdrawn": true, "service": "sms-shortener"}`, also when there was no consent. 400 for an unknown service or the bootstrap key; 401 for a bad key.
+
+### Record a consent (operators)
+
+```bash
+curl -X PUT https://yourdomain.com/api/keys/{id}/consents/sms-shortener \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"by": "admin@example.org"}'
+```
+
+Requires admin key. Records a consent given outside the sign-in flow (e.g. in writing); `by` says who agreed, `version` (`YYYY-MM-DD`, optional) defaults to the service's current `policyVersion`, and `byOwner` records the admin key used. 200 `{"id", "service", "consent"}`; 404 for an unknown key. The tests use it to give consents.
 
 ## Caching
 
