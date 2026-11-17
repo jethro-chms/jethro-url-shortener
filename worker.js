@@ -1047,6 +1047,36 @@ function jsonResponse(data, status = 200) {
 const MAGIC_LINK_TOKEN_TTL = 600; // 10 minutes in seconds
 
 /**
+ * Services a signup may be for, chosen by ?service= on /signup. A key works
+ * for every jethro.au service; the service only adds what the signer must
+ * acknowledge (its data handling) to the signup page and magic-link email.
+ * Unknown or absent → a plain URL shortener signup.
+ */
+const SIGNUP_SERVICES = {
+  'sms-shortener': {
+    name: 'the jethro.au SMS shortener',
+    acknowledgement: 'the text of SMS messages being written in Jethro will be sent to jethro.au and processed by Cloudflare Workers AI to suggest shorter wordings',
+    privacyPath: '/sms-shortener/privacy',
+  },
+};
+
+/**
+ * The acknowledgement for a signup's service, or null for a plain signup.
+ *
+ * @returns {{text: string, html: string} | null}
+ */
+function signupAcknowledgement(service, origin) {
+  const s = SIGNUP_SERVICES[service];
+  if (!s) return null;
+  const privacyUrl = origin + s.privacyPath;
+  const sentence = `By signing up for ${s.name}, you acknowledge that ${s.acknowledgement}.`;
+  return {
+    text: `${sentence} Please see the privacy policy at ${privacyUrl}`,
+    html: `${escapeHtml(sentence)} Please see the <a href="${escapeHtml(privacyUrl)}">privacy policy</a>.`,
+  };
+}
+
+/**
  * POST /signup — accept an email address, generate a one-time magic-link
  * token, store it in KV with a TTL, and send the link via email.
  */
@@ -1082,7 +1112,7 @@ async function handleEmailSignup(request, url, env) {
     { expirationTtl: MAGIC_LINK_TOKEN_TTL }
   );
 
-  const sent = await sendMagicLink(email, token, redirectOrigin(url), env);
+  const sent = await sendMagicLink(email, token, redirectOrigin(url), env, url.searchParams.get('service') || '');
   if (!sent) {
     // Clean up the KV entry so it can't be used later.
     await env.URL_MAPPINGS.delete(`ml:${token}`);
@@ -1162,11 +1192,14 @@ async function handleEmailCallback(request, url, env) {
 /**
  * Send a magic-link email via Resend (resend.com).
  *
- * Requires env.EMAIL_API_KEY (Resend API key) and env.EMAIL_FROM.
- * Returns true on success.
+ * Requires env.EMAIL_API_KEY (Resend API key) and env.EMAIL_FROM. For a
+ * service with an acknowledgement (SIGNUP_SERVICES), the email states it and
+ * links the privacy policy. Returns true on success.
  */
-async function sendMagicLink(email, token, origin, env) {
+async function sendMagicLink(email, token, origin, env, service = '') {
   const link = `${origin}/auth/email/callback?token=${encodeURIComponent(token)}`;
+  const ack = signupAcknowledgement(service, origin);
+  const serviceName = SIGNUP_SERVICES[service]?.name ?? 'the jethro.au URL shortener';
 
   try {
     const resp = await fetch('https://api.resend.com/emails', {
@@ -1179,11 +1212,12 @@ async function sendMagicLink(email, token, origin, env) {
         from: env.EMAIL_FROM,
         to: [email],
         subject: 'Your jethro.au API key — magic link',
-        text: `Sign in to receive your API key for the jethro.au URL shortener:\n\n${link}\n\nThis link expires in 10 minutes. If you didn't request this, you can ignore this email.`,
-        html: `<p>Click the link below to receive your API key for the jethro.au URL shortener:</p>
+        text: `Sign in to receive your API key for ${serviceName}:\n\n${link}\n\nThis link expires in 10 minutes. If you didn't request this, you can ignore this email.`
+          + (ack ? `\n\n${ack.text}` : ''),
+        html: `<p>Click the link below to receive your API key for ${escapeHtml(serviceName)}:</p>
 <p><a href="${link}">${link}</a></p>
 <p>This link expires in 10 minutes.</p>
-<p>If you didn't request this, you can ignore this email.</p>`,
+<p>If you didn't request this, you can ignore this email.</p>` + (ack ? `\n<p>${ack.html}</p>` : ''),
       }),
     });
 
@@ -1221,8 +1255,13 @@ const OAUTH_PROVIDERS = {
 function handleSignupPage(url, env) {
   const redirect = url.searchParams.get('redirect') || '';
   const campaign = url.searchParams.get('campaign') || '';
-  const campaignQS = campaign ? '&campaign=' + encodeURIComponent(campaign) : '';
-  const redirectQS = redirect ? '?redirect=' + encodeURIComponent(redirect) + campaignQS : '';
+  const service = url.searchParams.get('service') || '';
+  // Carried to the email form's POST and the OAuth login links.
+  const qs = new URLSearchParams();
+  if (redirect) qs.set('redirect', redirect);
+  if (redirect && campaign) qs.set('campaign', campaign);
+  if (SIGNUP_SERVICES[service]) qs.set('service', service);
+  const redirectQS = qs.size ? '?' + qs.toString() : '';
 
   const oauthButtons = Object.entries(OAUTH_PROVIDERS)
     .filter(([, p]) => p.clientId(env))
@@ -1235,8 +1274,13 @@ function handleSignupPage(url, env) {
     return htmlResponse(signupShell('<p>Self-service signup is not enabled on this server.</p>'), 501);
   }
 
-  let body = `<p>Sign in to receive an API key for creating short URLs.
-     You get one key; signing in again replaces it.</p>`;
+  const purpose = SIGNUP_SERVICES[service] ? `using ${escapeHtml(SIGNUP_SERVICES[service].name)}` : 'creating short URLs';
+  let body = `<p>Sign in to receive an API key for ${purpose}.
+     You get one key, which works for all jethro.au services; signing in again replaces it.</p>`;
+  const ack = signupAcknowledgement(service, redirectOrigin(url));
+  if (ack) {
+    body += `\n      <p><strong>${ack.html}</strong></p>`;
+  }
 
   // Magic-link email form.
   if (emailEnabled) {

@@ -88,6 +88,8 @@ All API keys (bootstrap, admin-created, and self-service) are stored hashed: `to
 
 Key holders can deregister themselves via `DELETE /api/keys/mine`, which revokes the key and scrubs their `createdBy` / `createdByCampaign` attribution from any URLs they created. The shortened URLs themselves are untouched — they continue to work, just anonymously.
 
+Keys work for every jethro.au service, including the [SMS shortener](https://github.com/jethro-chms/jethro-sms-shortener), which reads this Worker's key store. A signup for another service passes `?service=<name>` (currently `sms-shortener`; see `SIGNUP_SERVICES` in `worker.js`): the signup page and magic-link email then name that service and ask the signer to acknowledge its data handling, linking its privacy policy (e.g. `/sms-shortener/privacy`). Unknown values are ignored.
+
 Setup is optional — see [step 5 of the Quick Start](#5-optional-enable-self-service-api-key-signup). Providers with no client ID configured are hidden from `/signup`; with neither configured the page returns 501 and the feature is effectively off.
 
 ### Devbox tooling
