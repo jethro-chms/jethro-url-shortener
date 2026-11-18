@@ -637,6 +637,9 @@ async function runTests() {
     const [y, m, d] = SERVICES['url-shortener'].policyVersion.split('-').map(Number);
     const month = new Date(Date.UTC(y, m - 1, d)).toLocaleString('en-AU', { month: 'long', timeZone: 'UTC' });
     assert(html.includes(`Last updated ${d} ${month} ${y}.`), 'last-updated date');
+    assert(html.includes('Self-registered') && html.includes('Through a hosting provider'), 'both ways to register');
+    assert(html.includes('as vouched for by the provider'), 'vouched agreements');
+    assert(html.includes('can list the keys it issued'), 'what a provider can do');
   });
 
   await test('GET / names both services and links their privacy pages', async () => {

@@ -1138,16 +1138,16 @@ function jsonResponse(data, status = 200) {
 export const SERVICES = {
   'url-shortener': {
     name: 'jethro.au URL shortener',
-    policyVersion: '2026-11-18',
-    minPolicyVersion: '2026-11-18',
+    policyVersion: '2026-11-19',
+    minPolicyVersion: '2026-11-19',
     privacyPath: '/url-shortener/privacy',
     acknowledgement: 'web addresses shortened from Jethro will be stored at jethro.au with your organisation\'s name, '
       + 'and anyone who has a short link can follow it to the address',
   },
   'sms-shortener': {
     name: 'jethro.au SMS shortener',
-    policyVersion: '2026-11-18',
-    minPolicyVersion: '2026-11-18',
+    policyVersion: '2026-11-19',
+    minPolicyVersion: '2026-11-19',
     privacyPath: '/sms-shortener/privacy',
     acknowledgement: 'the text of SMS messages being written in Jethro will be sent to jethro.au and processed by Cloudflare Workers AI to suggest shorter wordings',
   },

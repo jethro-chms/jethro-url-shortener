@@ -143,14 +143,14 @@ curl https://jethro.au/api/validate -H "Authorization: Bearer $JETHROAU_API_KEY"
   "valid": true,
   "type": "create",
   "label": "admin@example.com",
-  "created": "2026-11-18T01:02:03.000Z",
+  "created": "2026-11-19T01:02:03.000Z",
   "createdByCampaign": "Example Church",
   "tokenPrefix": "cus_1234...",
   "services": {
     "url-shortener": {
       "name": "jethro.au URL shortener",
       "consented": true, "accepted": true, "current": true,
-      "version": "2026-11-18", "by": "admin@example.com", "at": "2026-11-18T01:02:03.000Z",
+      "version": "2026-11-19", "by": "admin@example.com", "at": "2026-11-19T01:02:03.000Z",
       "privacyUrl": "https://jethro.au/url-shortener/privacy"
     },
     "sms-shortener": {
@@ -271,7 +271,7 @@ A hosting provider running many Jethro installations (tenants) can register them
    curl -X PUT https://jethro.au/api/tenants/site-42.host.example/consents/sms-shortener \
      -H "Authorization: Bearer $PROVIDER_KEY" -H "Content-Type: application/json" \
      -d '{"agree": true, "by": {"name": "Example Sysadmin", "email": "sysadmin@example.org"}}'
-   # → 200 {"service": "sms-shortener", "consent": {"version": "2026-11-18", "by": "sysadmin@example.org",
+   # → 200 {"service": "sms-shortener", "consent": {"version": "2026-11-19", "by": "sysadmin@example.org",
    #         "byName": "Example Sysadmin", "byOwner": "vouched:<providerKeyId>", "vouchedBy": "<provider name>", "at": "..."}}
    ```
 
