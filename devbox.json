@@ -29,6 +29,7 @@
         "echo '  restore-url <code>             Restore a soft-deleted URL'",
         "echo '  delete-permanent <code>        Permanently delete a URL'",
         "echo '  create-key [--type] <label>     Create an API key'",
+        "echo '  create-provider-key <name>     Create a hosting provider key (prints the Jethro conf.php line)'",
         "echo '  list-keys                      List all API keys'",
         "echo '  revoke-key <id>                Revoke an API key'",
         "echo '  redirect <code>                Show redirect target'",
@@ -44,6 +45,7 @@
       "restore-url":      "scripts/shortener restore-url \"$@\"",
       "delete-permanent": "scripts/shortener delete-permanent \"$@\"",
       "create-key":       "scripts/shortener create-key \"$@\"",
+      "create-provider-key": "scripts/shortener create-provider-key \"$@\"",
       "revoke-key":       "scripts/shortener revoke-key \"$@\"",
       "redirect":         "scripts/shortener redirect \"$@\""
     }

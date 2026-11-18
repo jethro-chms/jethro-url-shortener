@@ -116,6 +116,25 @@ def click_stats(base_url: str, code: str, days: int) -> None:
     print()
 
 
+def create_provider_key(base_url: str, auth: str, label: str) -> None:
+    """Create a `provider` key and print how to configure Jethro with it.
+
+    The token is shown only here: jethro.au keeps just its hash. See README
+    "Hosting providers".
+    """
+    key = json_request(
+        "POST", f"{base_url}/api/keys",
+        headers={"Authorization": auth}, body={"type": "provider", "label": label},
+    )
+    print(
+        "\nCopy the token now; it is not shown again.\n"
+        "In the conf.php shared by the provider's Jethro sites:\n\n"
+        f"    define('JETHROAU_PROVIDER_KEY', '{key['token']}');\n\n"
+        "and in each site's conf.php, if BASE_URL's host isn't a stable, unique id for it:\n\n"
+        "    define('JETHROAU_TENANT', 'site-id');\n\n"
+        f"Revoke with: devbox run revoke-key {key['id']}"
+    )
+
 
 def main() -> None:
     env = load_env()
@@ -169,6 +188,13 @@ def main() -> None:
     p.add_argument("label", help="Key label")
     p.add_argument("--type", default="create", help="Key type (default: create)")
 
+    # create-provider-key <label>
+    p = sub.add_parser(
+        "create-provider-key",
+        help="Create a hosting provider's key, and print the conf.php line for its Jethro sites",
+    )
+    p.add_argument("label", help="The provider's name, as its tenants know it (shown as 'Managed by …')")
+
     # revoke-key <id>
     p = sub.add_parser("revoke-key", help="Revoke an API key")
     p.add_argument("id", help="Key ID")
@@ -213,6 +239,9 @@ def main() -> None:
 
     elif cmd == "create-key":
         json_request("POST", f"{base_url}/api/keys", headers={"Authorization": auth}, body={"type": args.type, "label": args.label})
+
+    elif cmd == "create-provider-key":
+        create_provider_key(base_url, auth, args.label)
 
     elif cmd == "revoke-key":
         json_request("DELETE", f"{base_url}/api/keys/{args.id}", headers={"Authorization": auth})

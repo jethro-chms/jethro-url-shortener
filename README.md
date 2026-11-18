@@ -125,6 +125,36 @@ Tenant keys are ordinary create keys (`issuedBy`, `tenant`, `owner: "tenant:{pro
 
 Provider keys can't shorten URLs, call services or hold consents (403 `{"error": "provider_key"}`). Self-service keys from `/signup` have no vouched path: their consents still need a sign-in. Revoking a provider key (`DELETE /api/keys/{id}`) does not revoke the keys it issued; revoke those first with `DELETE /api/tenants/{tenant}` if needed. See [PHP_INTEGRATION.md](PHP_INTEGRATION.md#hosting-providers) for the flow.
 
+#### Setting up a hosting provider
+
+1. **The jethro.au operator creates the provider key** (needs `URLSHORTENER_ADMIN_KEY` in `.env`):
+
+   ```bash
+   devbox run create-provider-key "Example Hosting"
+   ```
+
+   The name is shown to tenants as "Managed by …" and recorded on every agreement the provider vouches for. The command prints the token, which jethro.au doesn't keep, so it can't be shown again; lose it and create another. It also prints the `revoke-key` command for the key.
+
+2. **The provider configures its Jethro sites.** In the `conf.php` they all share:
+
+   ```php
+   define('JETHROAU_PROVIDER_KEY', 'cus_…');   // the token from step 1
+   ```
+
+   and in a site's own `conf.php`, unless the host name in its `BASE_URL` is a unique id that will never change:
+
+   ```php
+   define('JETHROAU_TENANT', 'site-id');   // unique per site, never changed
+   ```
+
+   jethro.au keeps one key per provider and tenant id: a site whose id changes gets a fresh key without its agreements, and two sites sharing an id share a key. The default, when `BASE_URL` has no host, is the database name. Each site's `SYSTEM_NAME` is sent as its organisation name.
+
+   Never put `JETHROAU_API_KEY` (or `JETHROAU_SERVICES`) in a shared `conf.php`: agreements belong to a key, so every site would share them. Jethro stores each site's own key in its database.
+
+3. **Each site's sysadmin turns services on.** In System Configuration → *jethro.au Services*, **Turn on URL shortening** / **Turn on SMS shortening** shows the service's privacy notice and "I agree to the privacy policy of … on behalf of <SYSTEM_NAME>". Confirming gets the site its key (first time only) and records the agreement with the sysadmin's name and email, vouched for by the provider. Nobody signs in at jethro.au. **Turn off** withdraws an agreement; **Deregister** revokes the site's key.
+
+A site that registered itself before its provider set a provider key keeps working with its own key until a sysadmin turns a service on; Jethro then replaces it with a tenant key, without its old agreements or short-URL attribution. Deregister first to revoke the old key rather than leave it live.
+
 ### Devbox tooling
 
 [Devbox](https://www.jetify.com/devbox) manages Node.js and PHP runtimes. Commands:
@@ -137,6 +167,7 @@ devbox run stats <code> [--days N]   # Click counts from zone analytics (≤30 d
 devbox run list-urls            # List all active URLs
 devbox run list-keys            # List API keys
 devbox run create-key <label> [--type <type>]   # Create an API key
+devbox run create-provider-key <name>           # Create a hosting provider key (prints Jethro conf.php lines)
 devbox run revoke-key <id>      # Revoke an API key
 devbox run redirect <code>      # Show redirect target
 devbox run help                 # Show all commands
