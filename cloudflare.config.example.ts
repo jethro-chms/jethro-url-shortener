@@ -59,6 +59,14 @@ export default defineConfig({
 				zone: "yourdomain.com",
 			}),
 			triggers.fetch({
+				pattern: "yourdomain.com/api/tenants*",
+				zone: "yourdomain.com",
+			}),
+			triggers.fetch({
+				pattern: "yourdomain.com/api/tenants/*",
+				zone: "yourdomain.com",
+			}),
+			triggers.fetch({
 				pattern: "yourdomain.com/url-shortener/*",
 				zone: "yourdomain.com",
 			}),

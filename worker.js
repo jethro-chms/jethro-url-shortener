@@ -69,6 +69,22 @@ export default {
       return handleDeleteKey(request, url, env);
     }
 
+    // API: tenants of a hosting provider (provider keys only)
+    if (url.pathname === '/api/tenants' && request.method === 'GET') {
+      return handleListTenants(request, env);
+    }
+    if (url.pathname === '/api/tenants' && request.method === 'POST') {
+      return handleMintTenantKey(request, env);
+    }
+    const tenantConsentMatch = url.pathname.match(/^\/api\/tenants\/([^/]+)\/consents\/([^/]+)$/);
+    if (tenantConsentMatch && (request.method === 'PUT' || request.method === 'DELETE')) {
+      return handleTenantConsent(request, env, tenantConsentMatch[1], tenantConsentMatch[2]);
+    }
+    const tenantMatch = url.pathname.match(/^\/api\/tenants\/([^/]+)$/);
+    if (tenantMatch && request.method === 'DELETE') {
+      return handleRevokeTenant(request, env, tenantMatch[1]);
+    }
+
     // API: Validate the current API key (authenticated)
     if (url.pathname === '/api/validate' && request.method === 'GET') {
       return handleValidateKey(request, env);
@@ -199,7 +215,7 @@ async function handleShortUrl(request, url, env) {
   const { code, restPath } = parseShortPath(url);
 
   // Codes never contain ':' — reject early so reserved KV records
-  // (apikey:, idx:, tok:, owner:, ml:, ct:) are unreachable via public routes
+  // (apikey:, idx:, tok:, owner:, tenant:, ml:, ct:) are unreachable via public routes
   if (!code || code.includes(':')) {
     return new Response('Invalid short URL', {
       status: 400,
@@ -387,7 +403,7 @@ async function handleListUrls(request, env) {
       totalKeys += listResult.keys.length;
 
       for (const key of listResult.keys) {
-        if (key.name.includes(':')) continue; // skip reserved records (idx:, apikey:, tok:, owner:, ml:, ct:)
+        if (key.name.includes(':')) continue; // skip reserved records (idx:, apikey:, tok:, owner:, tenant:, ml:, ct:)
 
         const mapping = await env.URL_MAPPINGS.get(key.name, { type: 'json' });
         if (!mapping || mapping.deleted) continue;
@@ -605,7 +621,7 @@ async function handleListDeletedUrls(request, env) {
       const listResult = await env.URL_MAPPINGS.list({ cursor });
 
       for (const key of listResult.keys) {
-        if (key.name.includes(':')) continue; // skip reserved records (idx:, apikey:, tok:, owner:, ml:, ct:)
+        if (key.name.includes(':')) continue; // skip reserved records (idx:, apikey:, tok:, owner:, tenant:, ml:, ct:)
 
         const mapping = await env.URL_MAPPINGS.get(key.name, { type: 'json' });
         if (mapping && mapping.deleted) {
@@ -717,7 +733,7 @@ async function sha256Hex(input) {
 /**
  * Short codes: 1-64 chars of [A-Za-z0-9_-].
  * Excludes ':' so user codes can never collide with reserved KV prefixes
- * (idx:, apikey:, tok:, owner:, ml:, ct:).
+ * (idx:, apikey:, tok:, owner:, tenant:, ml:, ct:).
  */
 function isValidShortCode(code) {
   return typeof code === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(code);
@@ -864,6 +880,7 @@ async function handleListKeys(request, env) {
           created: keyData.created,
           tokenPrefix: keyData.tokenPrefix || (keyData.token ? keyData.token.slice(0, 8) + '...' : ''),
           ...(keyData.owner ? { owner: keyData.owner, ownerEmail: keyData.ownerEmail } : {}),
+          ...(keyData.issuedBy ? { issuedBy: keyData.issuedBy, tenant: keyData.tenant } : {}),
           ...(keyData.createdByCampaign ? { createdByCampaign: keyData.createdByCampaign } : {}),
           ...(keyData.consents && Object.keys(keyData.consents).length ? { consents: keyData.consents } : {}),
         });
@@ -880,7 +897,11 @@ async function handleListKeys(request, env) {
 
 /**
  * POST /api/keys — Create a new API key (admin only)
- * Body: { type: "admin"|"create", label: "..." }
+ * Body: { type: "admin"|"create"|"provider", label: "..." }
+ *
+ * A provider key belongs to a hosting provider (label: its name, required):
+ * it issues and manages its tenants' keys through /api/tenants, but cannot
+ * use services or hold consents itself.
  */
 async function handleCreateKey(request, env) {
   const err = await requireAdmin(request, env);
@@ -890,11 +911,14 @@ async function handleCreateKey(request, env) {
     const body = await request.json();
     const { type, label } = body;
 
-    if (!type || !['admin', 'create'].includes(type)) {
-      return jsonResponse({ error: 'type must be "admin" or "create"' }, 400);
+    if (!type || !['admin', 'create', 'provider'].includes(type)) {
+      return jsonResponse({ error: 'type must be "admin", "create" or "provider"' }, 400);
     }
     if (label && (typeof label !== 'string' || label.length > 100)) {
       return jsonResponse({ error: 'label must be a string under 100 characters' }, 400);
+    }
+    if (type === 'provider' && !label?.trim()) {
+      return jsonResponse({ error: 'label (the provider\'s name) is required for a provider key' }, 400);
     }
 
     const id = crypto.randomUUID();
@@ -926,7 +950,8 @@ async function handleCreateKey(request, env) {
 }
 
 /**
- * DELETE /api/keys/{id} — Revoke an API key (admin only)
+ * DELETE /api/keys/{id} — Revoke an API key (admin only). Unlike
+ * DELETE /api/keys/mine, the key's URLs keep their attribution.
  */
 async function handleDeleteKey(request, url, env) {
   const err = await requireAdmin(request, env);
@@ -942,10 +967,8 @@ async function handleDeleteKey(request, url, env) {
       return jsonResponse({ error: 'Key not found' }, 404);
     }
 
-    // Prevent deleting the bootstrap key via KV (can't delete env.API_KEY anyway)
-    await env.URL_MAPPINGS.delete(`apikey:${id}`);
-    if (existing.tokenHash) await env.URL_MAPPINGS.delete(`tok:${existing.tokenHash}`);
-    if (existing.owner) await env.URL_MAPPINGS.delete(`owner:${existing.owner}`);
+    // The bootstrap key has no KV record, so it can't be deleted here.
+    await deleteKeyRecords(env, existing);
     return jsonResponse({ revoked: true, id });
   } catch (error) {
     console.error('Error deleting key:', error);
@@ -955,12 +978,12 @@ async function handleDeleteKey(request, url, env) {
 
 /**
  * DELETE /api/keys/mine — Revoke the calling key (self-service deregistration).
- * Any valid key (admin, create, or self-service) can revoke itself.
+ * Any valid key (admin, create, provider, self-service or tenant) can revoke itself.
  * The bootstrap env.API_KEY cannot be revoked this way.
  *
- * After deleting the key records, scans all URL mappings and scrubs any
- * createdBy / createdByCampaign attribution that matches this key's owner,
- * so that deregistration leaves no trace of the owner's identity or campaign.
+ * Deletes the key's records ({@link deleteKeyRecords}), then scrubs its
+ * attribution from the URLs it created ({@link scrubAttribution}), so that
+ * deregistration leaves no trace of the owner's identity or campaign.
  */
 async function handleDeleteOwnKey(request, env) {
   const auth = await verifyApiKey(request, env);
@@ -973,31 +996,8 @@ async function handleDeleteOwnKey(request, env) {
   }
 
   try {
-    const existing = await env.URL_MAPPINGS.get(`apikey:${auth.keyId}`, { type: 'json' });
-    const owner = existing?.owner || null;
-
-    // Delete the key records.
-    await env.URL_MAPPINGS.delete(`apikey:${auth.keyId}`);
-    if (existing && existing.tokenHash) await env.URL_MAPPINGS.delete(`tok:${existing.tokenHash}`);
-    if (owner) await env.URL_MAPPINGS.delete(`owner:${owner}`);
-
-    // Scrub attribution from any URL this key created.
-    if (owner) {
-      let cursor = null;
-      do {
-        const listResult = await env.URL_MAPPINGS.list({ cursor });
-        for (const key of listResult.keys) {
-          if (key.name.includes(':')) continue;
-          const mapping = await env.URL_MAPPINGS.get(key.name, { type: 'json' });
-          if (!mapping || mapping.createdBy !== owner) continue;
-          delete mapping.createdBy;
-          delete mapping.createdByCampaign;
-          await env.URL_MAPPINGS.put(key.name, JSON.stringify(mapping));
-        }
-        cursor = listResult.list_complete ? null : listResult.cursor;
-      } while (cursor);
-    }
-
+    await deleteKeyRecords(env, auth.key);
+    if (auth.key.owner) await scrubAttribution(env, auth.key.owner);
     return jsonResponse({ revoked: true, id: auth.keyId });
   } catch (error) {
     console.error('Error deleting own key:', error);
@@ -1006,20 +1006,58 @@ async function handleDeleteOwnKey(request, env) {
 }
 
 /**
+ * Delete a key's records: apikey:{id}, its tok: lookup, and the index that
+ * finds it by owner — owner:{owner} for self-service keys, or
+ * tenant:{providerKeyId}:{tenant} for tenant keys (when it still points here).
+ */
+async function deleteKeyRecords(env, key) {
+  await env.URL_MAPPINGS.delete(`apikey:${key.id}`);
+  if (key.tokenHash) await env.URL_MAPPINGS.delete(`tok:${key.tokenHash}`);
+  if (key.issuedBy && key.tenant) {
+    const indexKey = tenantIndexKey(key.issuedBy, key.tenant);
+    const index = await env.URL_MAPPINGS.get(indexKey, { type: 'json' });
+    if (index?.keyId === key.id) await env.URL_MAPPINGS.delete(indexKey);
+  } else if (key.owner) {
+    await env.URL_MAPPINGS.delete(`owner:${key.owner}`);
+  }
+}
+
+/**
+ * Remove createdBy / createdByCampaign from every URL mapping created by
+ * `owner`. Scans the whole namespace; the URLs themselves keep working.
+ */
+async function scrubAttribution(env, owner) {
+  let cursor = null;
+  do {
+    const listResult = await env.URL_MAPPINGS.list({ cursor });
+    for (const key of listResult.keys) {
+      if (key.name.includes(':')) continue;
+      const mapping = await env.URL_MAPPINGS.get(key.name, { type: 'json' });
+      if (!mapping || mapping.createdBy !== owner) continue;
+      delete mapping.createdBy;
+      delete mapping.createdByCampaign;
+      await env.URL_MAPPINGS.put(key.name, JSON.stringify(mapping));
+    }
+    cursor = listResult.list_complete ? null : listResult.cursor;
+  } while (cursor);
+}
+
+/**
  * GET /api/validate — Validate the current Bearer token and return its metadata.
- * Any valid key (admin, create, or self-service) can call this.
+ * Any valid key (admin, create, provider, self-service or tenant) can call this.
  *
  * `services` reports, for every service in SERVICES, whether the key's
  * organisation has agreed to it ({@link consentStatus}) and where its privacy
  * page is. Admin keys need no consent: consented/accepted/current are true and
- * version/by/at null.
+ * version/by/at null. Provider keys use no services, so get no `services`.
+ * Tenant keys add `issuedBy` (the provider's label, null once the provider key
+ * is revoked) and `tenant`.
  */
 async function handleValidateKey(request, env) {
   const auth = await verifyApiKey(request, env);
   if (!auth.authorized) {
     return jsonResponse({ error: 'Unauthorized' }, 401);
   }
-  const services = serviceStatuses(auth, new URL(request.url));
 
   // Bootstrap admin key — no keyId or KV record.
   if (!auth.key) {
@@ -1028,11 +1066,16 @@ async function handleValidateKey(request, env) {
       type: 'admin',
       label: 'Bootstrap admin key',
       created: null,
-      services,
+      services: serviceStatuses(auth, new URL(request.url)),
     });
   }
 
   const keyData = auth.key;
+  let issuedBy = null;
+  if (keyData.issuedBy) {
+    const provider = await env.URL_MAPPINGS.get(`apikey:${keyData.issuedBy}`, { type: 'json' });
+    issuedBy = provider?.label ?? null;
+  }
   return jsonResponse({
     valid: true,
     type: keyData.type,
@@ -1041,9 +1084,10 @@ async function handleValidateKey(request, env) {
     ...(keyData.owner ? { owner: keyData.owner } : {}),
     ...(keyData.ownerEmail ? { ownerEmail: keyData.ownerEmail } : {}),
     ...(keyData.provider ? { provider: keyData.provider } : {}),
+    ...(keyData.issuedBy ? { issuedBy, tenant: keyData.tenant } : {}),
     ...(keyData.createdByCampaign ? { createdByCampaign: keyData.createdByCampaign } : {}),
     tokenPrefix: keyData.tokenPrefix || (keyData.token ? keyData.token.slice(0, 8) + '...' : ''),
-    services,
+    ...(keyData.type === 'provider' ? {} : { services: serviceStatuses(auth, new URL(request.url)) }),
   });
 }
 
@@ -1171,10 +1215,10 @@ function newConsent(serviceId, identity) {
 
 /**
  * Require a key that may use a service: admin, or create with an accepted
- * consent to it.
+ * consent to it. Provider keys never may.
  *
  * @returns {Promise<{err: Response|null, auth: object}>} err: 401 { error: 'Unauthorized' },
- *   or 403 { error: 'consent_required'|'consent_outdated', service, privacyUrl }
+ *   403 { error: 'provider_key' }, or 403 { error: 'consent_required'|'consent_outdated', service, privacyUrl }
  */
 async function requireService(request, env, serviceId) {
   const auth = await verifyApiKey(request, env);
@@ -1182,6 +1226,7 @@ async function requireService(request, env, serviceId) {
     return { err: jsonResponse({ error: 'Unauthorized' }, 401), auth };
   }
   if (auth.type === 'admin') return { err: null, auth };
+  if (auth.type === 'provider') return { err: providerKeyRefused(), auth };
   if (auth.type !== 'create') {
     return { err: jsonResponse({ error: 'Forbidden: create key required' }, 403), auth };
   }
@@ -1197,6 +1242,11 @@ async function requireService(request, env, serviceId) {
     };
   }
   return { err: null, auth };
+}
+
+/** 403 for a provider key where only a key that uses services will do. */
+function providerKeyRefused() {
+  return jsonResponse({ error: 'provider_key' }, 403);
 }
 
 /**
@@ -1229,6 +1279,7 @@ async function handleCreateConsentTicket(request, url, env) {
   const auth = await verifyApiKey(request, env);
   if (!auth.authorized) return jsonResponse({ error: 'Unauthorized' }, 401);
   if (!auth.key) return jsonResponse({ error: 'The bootstrap admin key needs no consent' }, 400);
+  if (auth.type === 'provider') return providerKeyRefused();
 
   let body;
   try {
@@ -1267,6 +1318,7 @@ async function handleWithdrawConsent(request, env, serviceId) {
   if (!auth.authorized) return jsonResponse({ error: 'Unauthorized' }, 401);
   if (!serviceOf(serviceId)) return jsonResponse({ error: 'Unknown service', service: serviceId }, 400);
   if (!auth.key) return jsonResponse({ error: 'The bootstrap admin key needs no consent' }, 400);
+  if (auth.type === 'provider') return providerKeyRefused();
 
   const key = auth.key;
   if (key.consents && Object.hasOwn(key.consents, serviceId)) {
@@ -1307,6 +1359,7 @@ async function handleAdminPutConsent(request, env, keyId, serviceId) {
 
   const key = await env.URL_MAPPINGS.get(`apikey:${keyId}`, { type: 'json' });
   if (!key) return jsonResponse({ error: 'Key not found' }, 404);
+  if (key.type === 'provider') return jsonResponse({ error: 'Provider keys hold no consents' }, 400);
   const consent = {
     version,
     by: by.trim(),
@@ -1316,6 +1369,231 @@ async function handleAdminPutConsent(request, env, keyId, serviceId) {
   key.consents = { ...key.consents, [serviceId]: consent };
   await env.URL_MAPPINGS.put(`apikey:${keyId}`, JSON.stringify(key));
   return jsonResponse({ id: keyId, service: serviceId, consent });
+}
+
+// ---------------------------------------------------------------------------
+// Hosting providers and their tenants.
+//
+// A hosting provider running many Jethro installations (tenants) holds one
+// provider key (POST /api/keys, type 'provider', admin only). With it, it
+// issues each tenant its own create key, and records a tenant's consent to a
+// service on the word of the tenant's sysadmin, whom the provider has
+// authenticated — so tenants never sign in at jethro.au. Tenant keys are
+// ordinary create keys, so their consents, rate limits and URL attribution
+// stay separate:
+//   apikey:{id} → { …, type: 'create', issuedBy: providerKeyId, tenant,
+//                   owner: 'tenant:{providerKeyId}:{tenant}', createdByCampaign: name }
+//   tenant:{providerKeyId}:{tenant} → { keyId }   (a provider's tenants, by id)
+// Vouched consents: { version, by: email, byName, byOwner: 'vouched:{providerKeyId}',
+// vouchedBy: provider label, at }. Self-service keys have no vouched path.
+// ---------------------------------------------------------------------------
+
+/** KV key indexing a provider's tenant; also the tenant key's owner. */
+function tenantIndexKey(providerKeyId, tenant) {
+  return `tenant:${providerKeyId}:${tenant}`;
+}
+
+/** Stable tenant ids: 1-200 chars of [A-Za-z0-9._:-]. */
+function isValidTenantId(tenant) {
+  return typeof tenant === 'string' && /^[A-Za-z0-9._:-]{1,200}$/.test(tenant);
+}
+
+/**
+ * Require a provider key.
+ *
+ * @returns {Promise<{err: Response|null, auth: object}>} err: 401 { error: 'Unauthorized' }
+ *   or 403 { error: 'provider_key_required' }
+ */
+async function requireProvider(request, env) {
+  const auth = await verifyApiKey(request, env);
+  if (!auth.authorized) return { err: jsonResponse({ error: 'Unauthorized' }, 401), auth };
+  if (auth.type !== 'provider') return { err: jsonResponse({ error: 'provider_key_required' }, 403), auth };
+  return { err: null, auth };
+}
+
+/**
+ * A provider's tenant from a URL path segment, with its key.
+ *
+ * @returns {Promise<{err: Response} | {tenant: string, indexKey: string, key: object}>}
+ *   err: 400 for an invalid tenant id, 404 for a tenant without a key
+ */
+async function findTenant(env, providerKeyId, segment) {
+  let tenant;
+  try {
+    tenant = decodeURIComponent(segment);
+  } catch {
+    tenant = '';
+  }
+  if (!isValidTenantId(tenant)) return { err: jsonResponse({ error: 'Invalid tenant id' }, 400) };
+  const indexKey = tenantIndexKey(providerKeyId, tenant);
+  const index = await env.URL_MAPPINGS.get(indexKey, { type: 'json' });
+  const key = index?.keyId ? await env.URL_MAPPINGS.get(`apikey:${index.keyId}`, { type: 'json' }) : null;
+  if (!key) return { err: jsonResponse({ error: 'Unknown tenant', tenant }, 404) };
+  return { tenant, indexKey, key };
+}
+
+/**
+ * POST /api/tenants (provider key) — issue a tenant's key.
+ * Body: { tenant: stable id (1-200 chars of [A-Za-z0-9._:-]), name: organisation name (1-100 chars) }
+ *
+ * Mints a create key with issuedBy, tenant, owner 'tenant:{providerKeyId}:{tenant}'
+ * and createdByCampaign = name. If the tenant already has a key, that key is
+ * revoked and its consents carry over to the new one (replaced: true); its
+ * URLs keep their attribution, since the owner is the same.
+ * → 201 { token, id, tenant, replaced }; 400 bad input; 401; 403 provider_key_required.
+ */
+async function handleMintTenantKey(request, env) {
+  const { err, auth } = await requireProvider(request, env);
+  if (err) return err;
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: 'Body must be JSON' }, 400);
+  }
+  const tenant = body?.tenant;
+  if (!isValidTenantId(tenant)) {
+    return jsonResponse({ error: 'tenant must be 1-200 characters: letters, digits, ".", "_", ":" or "-"' }, 400);
+  }
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!name || name.length > 100) {
+    return jsonResponse({ error: 'name must be a non-empty string of at most 100 characters' }, 400);
+  }
+
+  const indexKey = tenantIndexKey(auth.keyId, tenant);
+  const prev = await env.URL_MAPPINGS.get(indexKey, { type: 'json' });
+  const prevKey = prev?.keyId ? await env.URL_MAPPINGS.get(`apikey:${prev.keyId}`, { type: 'json' }) : null;
+  if (prevKey) {
+    await env.URL_MAPPINGS.delete(`apikey:${prevKey.id}`);
+    if (prevKey.tokenHash) await env.URL_MAPPINGS.delete(`tok:${prevKey.tokenHash}`);
+  }
+
+  const id = crypto.randomUUID();
+  const token = 'cus_' + crypto.randomUUID().replace(/-/g, '');
+  const tokenHash = await sha256Hex(token);
+  const keyData = {
+    id,
+    type: 'create',
+    label: name,
+    issuedBy: auth.keyId,
+    tenant,
+    owner: indexKey,
+    createdByCampaign: name,
+    tokenPrefix: token.slice(0, 8) + '...',
+    tokenHash,
+    created: new Date().toISOString(),
+    consents: { ...prevKey?.consents },
+  };
+  await env.URL_MAPPINGS.put(`apikey:${id}`, JSON.stringify(keyData));
+  await env.URL_MAPPINGS.put(`tok:${tokenHash}`, JSON.stringify({ id }));
+  await env.URL_MAPPINGS.put(indexKey, JSON.stringify({ keyId: id }));
+
+  return jsonResponse({ token, id, tenant, replaced: !!prevKey }, 201);
+}
+
+/**
+ * GET /api/tenants (provider key) — the provider's tenants:
+ * [{ tenant, name, keyId, tokenPrefix, created, consents }].
+ */
+async function handleListTenants(request, env) {
+  const { err, auth } = await requireProvider(request, env);
+  if (err) return err;
+
+  const prefix = tenantIndexKey(auth.keyId, '');
+  const tenants = [];
+  let cursor = null;
+  do {
+    const listResult = await env.URL_MAPPINGS.list({ prefix, cursor });
+    for (const { name: indexKey } of listResult.keys) {
+      const index = await env.URL_MAPPINGS.get(indexKey, { type: 'json' });
+      const key = index?.keyId ? await env.URL_MAPPINGS.get(`apikey:${index.keyId}`, { type: 'json' }) : null;
+      if (!key) continue;
+      tenants.push({
+        tenant: indexKey.slice(prefix.length),
+        name: key.createdByCampaign || '',
+        keyId: key.id,
+        tokenPrefix: key.tokenPrefix,
+        created: key.created,
+        consents: key.consents ?? {},
+      });
+    }
+    cursor = listResult.list_complete ? null : listResult.cursor;
+  } while (cursor);
+  return jsonResponse(tenants);
+}
+
+/**
+ * PUT /api/tenants/{tenant}/consents/{service} (provider key) — record the
+ * tenant's consent to a service on the word of its sysadmin.
+ * Body: { agree: true, by: { name?: (≤100 chars), email: (≤254 chars) } }
+ * → 200 { service, consent } with consent { version, by, byName, byOwner: 'vouched:{providerKeyId}',
+ *   vouchedBy, at }; 400 unknown service, agree !== true or bad by; 404 unknown tenant; 401; 403.
+ *
+ * DELETE /api/tenants/{tenant}/consents/{service} (provider key) — withdraw it.
+ * Idempotent: 200 { withdrawn: true, service }; 400 unknown service; 404 unknown tenant.
+ */
+async function handleTenantConsent(request, env, tenantSegment, serviceId) {
+  const { err, auth } = await requireProvider(request, env);
+  if (err) return err;
+  if (!serviceOf(serviceId)) return jsonResponse({ error: 'Unknown service', service: serviceId }, 400);
+
+  let consent = null;
+  if (request.method === 'PUT') {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return jsonResponse({ error: 'Body must be JSON' }, 400);
+    }
+    if (body?.agree !== true) return jsonResponse({ error: 'agree must be true' }, 400);
+    const email = typeof body.by?.email === 'string' ? body.by.email.trim() : '';
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+      return jsonResponse({ error: 'by.email must be an email address of at most 254 characters' }, 400);
+    }
+    const name = body.by.name ?? '';
+    if (typeof name !== 'string' || name.length > 100) {
+      return jsonResponse({ error: 'by.name must be a string of at most 100 characters' }, 400);
+    }
+    consent = {
+      version: SERVICES[serviceId].policyVersion,
+      by: email,
+      byName: name.trim(),
+      byOwner: `vouched:${auth.keyId}`,
+      vouchedBy: auth.key.label,
+      at: new Date().toISOString(),
+    };
+  }
+
+  const found = await findTenant(env, auth.keyId, tenantSegment);
+  if (found.err) return found.err;
+  const key = found.key;
+  if (consent) {
+    key.consents = { ...key.consents, [serviceId]: consent };
+    await env.URL_MAPPINGS.put(`apikey:${key.id}`, JSON.stringify(key));
+    return jsonResponse({ service: serviceId, consent });
+  }
+  if (key.consents && Object.hasOwn(key.consents, serviceId)) {
+    delete key.consents[serviceId];
+    await env.URL_MAPPINGS.put(`apikey:${key.id}`, JSON.stringify(key));
+  }
+  return jsonResponse({ withdrawn: true, service: serviceId });
+}
+
+/**
+ * DELETE /api/tenants/{tenant} (provider key) — revoke the tenant's key exactly
+ * as its own DELETE /api/keys/mine would, scrubbing its URLs' attribution.
+ * → 200 { revoked: true, tenant }; 404 unknown tenant.
+ */
+async function handleRevokeTenant(request, env, tenantSegment) {
+  const { err, auth } = await requireProvider(request, env);
+  if (err) return err;
+  const found = await findTenant(env, auth.keyId, tenantSegment);
+  if (found.err) return found.err;
+
+  await deleteKeyRecords(env, found.key);
+  await scrubAttribution(env, found.key.owner);
+  return jsonResponse({ revoked: true, tenant: found.tenant });
 }
 
 /**

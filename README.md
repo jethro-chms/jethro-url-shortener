@@ -69,12 +69,13 @@ Upstream stores click statistics in `stats:{code}` KV keys with per-source break
 
 ### Multi-key authentication
 
-Two key types stored in KV with full CRUD management:
+Three key types stored in KV with full CRUD management:
 
 | Type | Scope |
 |------|-------|
 | `admin` | Full access — create, list, update, delete URLs; manage API keys |
 | `create` | Create-only — can shorten URLs, cannot list/update/delete |
+| `provider` | A hosting provider's key — issues and manages its tenants' create keys via `/api/tenants`; cannot shorten URLs or use services itself (see [Hosting providers](#hosting-providers)) |
 
 Keys are revocable without rotating the bootstrap admin key. The bootstrap key is set via `cf workers secrets update API_KEY` and stored as a Cloudflare Workers secret.
 
@@ -108,8 +109,21 @@ Consent is given:
 - **At signup**, with `?service=<id>` on `/signup`: the page states what the service shares, links its privacy page, and requires an **I agree to this on behalf of …** checkbox. The worker enforces the checkbox for email and OAuth sign-ins, mints the key with that consent, and adds `sh_consented=<id>` to the redirect back.
 - **Later**, for an existing key: `POST /api/consents` returns a single-use consent URL (10 minutes) whose page names the service and the organisation the key is registered to, and asks someone to tick **I agree** and sign in. The consent is then recorded with their identity and the browser is redirected back with `sh_consented=<id>`.
 - **By an operator**, with `PUT /api/keys/{id}/consents/{service}` (admin only), for agreement given another way, e.g. in writing.
+- **By a hosting provider**, for its tenants' keys only, on the word of the tenant's sysadmin (see [Hosting providers](#hosting-providers)).
 
 Consents are kept until withdrawn (`DELETE /api/consents/{service}`) or the key is revoked. Signing in again, which replaces the key, carries its consents over. A service refuses a create key without an accepted consent with 403 `{ "error": "consent_required" | "consent_outdated", "service", "privacyUrl" }`; `GET /api/validate` reports every service's status. See [PHP_INTEGRATION.md](PHP_INTEGRATION.md) for the flow from Jethro's side.
+
+### Hosting providers
+
+A hosting provider running many Jethro installations (tenants) gets one **provider key** from the operator (`POST /api/keys` with `"type": "provider"` and its name as `label`). With it, the provider:
+
+- issues each tenant its own create key (`POST /api/tenants`), keyed by a stable tenant id and named after the tenant's organisation;
+- records a tenant's consent to a service on the word of the tenant's sysadmin, whom the provider's own Jethro hosting has authenticated (`PUT /api/tenants/{tenant}/consents/{service}`), so tenants never sign in at jethro.au;
+- withdraws consents, lists its tenants, and revokes tenant keys.
+
+Tenant keys are ordinary create keys (`issuedBy`, `tenant`, `owner: "tenant:{providerKeyId}:{tenant}"`, `createdByCampaign` = the organisation name), so each tenant's consents, rate limits and URL attribution stay separate. `tenant:{providerKeyId}:{tenant}` → `{keyId}` indexes them. Minting a key for a tenant that already has one revokes the old key and carries its consents over. A vouched consent records `by` (the sysadmin's email), `byName`, `byOwner: "vouched:{providerKeyId}"`, `vouchedBy` (the provider's label), `version` and `at`.
+
+Provider keys can't shorten URLs, call services or hold consents (403 `{"error": "provider_key"}`). Self-service keys from `/signup` have no vouched path: their consents still need a sign-in. Revoking a provider key (`DELETE /api/keys/{id}`) does not revoke the keys it issued; revoke those first with `DELETE /api/tenants/{tenant}` if needed. See [PHP_INTEGRATION.md](PHP_INTEGRATION.md#hosting-providers) for the flow.
 
 ### Devbox tooling
 
@@ -175,7 +189,7 @@ devbox run -- php src/php/shorten.php https://example.com/my-post twitter
 
 `devbox run test` — PHP functional test against the live API: predicts a short code via `previewShorten()`, creates it via the live API, confirms the codes match, fetches the short URL, and validates the 302 redirect to the original target.
 
-`node test_worker.js` — Worker tests (59). The first 14 run `worker.js` in-process with a fake KV namespace and faked Resend and GitHub APIs, covering signup and consent end to end: the agree checkbox enforced by the server, consents minted at signup and carried over on re-signup, consent tickets through email and OAuth sign-in, and tickets being single use. The other 45 are an HTTP integration suite (services and consent through the admin API, `/api/authorize`, `/api/shorten` with and without consent, `/api/consents`, the privacy and landing pages). Point it at a deployed worker, or run the worker locally:
+`node test_worker.js` — Worker tests (72). The first 14 run `worker.js` in-process with a fake KV namespace and faked Resend and GitHub APIs, covering signup and consent end to end: the agree checkbox enforced by the server, consents minted at signup and carried over on re-signup, consent tickets through email and OAuth sign-in, and tickets being single use. The other 58 are an HTTP integration suite (services and consent through the admin API, `/api/authorize`, `/api/shorten` with and without consent, `/api/consents`, provider keys and `/api/tenants`, the privacy and landing pages). Point it at a deployed worker, or run the worker locally:
 
 ```bash
 # .dev.vars holds local values for secrets declared in cloudflare.config.ts
@@ -228,7 +242,7 @@ triggers.fetch({ pattern: "yourdomain.com/s/*", zone: "yourdomain.com" }),
 URL_MAPPINGS: bindings.kv({ id: "YOUR_KV_NAMESPACE_ID" }), // from step 2
 ```
 
-The example config also routes the zone root (`yourdomain.com/`) to the worker's landing page, plus `/consent*`, `/api/authorize*`, `/api/consents*` and `/url-shortener/*` for the consent flow and the privacy page. If you upgraded from an earlier version, add those triggers too — without them the requests fall through to the origin and hang.
+The example config also routes the zone root (`yourdomain.com/`) to the worker's landing page, plus `/consent*`, `/api/authorize*`, `/api/consents*`, `/api/tenants*` and `/url-shortener/*` for the consent flow, hosting providers and the privacy page. If you upgraded from an earlier version, add those triggers too — without them the requests fall through to the origin and hang.
 
 Set `PRIVACY_OPERATOR` and `PRIVACY_CONTACT`: they name who runs the service, and how to reach them, on the privacy page and landing page.
 
@@ -530,7 +544,7 @@ Response:
 }
 ```
 
-The `token` is only returned once on creation. `type` must be `"admin"` or `"create"`. Requires admin key.
+The `token` is only returned once on creation. `type` must be `"admin"`, `"create"` or `"provider"`; a provider key needs a `label` (the provider's name). Requires admin key.
 
 ### Revoke an API key
 
@@ -548,7 +562,7 @@ curl -X DELETE https://yourdomain.com/api/keys/mine \
   -H "Authorization: Bearer YOUR_API_KEY"
 ```
 
-Any valid key can revoke itself. This deletes the key (with its consents) from KV and scrubs the owner's identity and campaign from any URLs they created — the shortened URLs themselves continue to work.
+Any valid key can revoke itself. This deletes the key (with its consents, and its tenant index entry for a tenant key) from KV and scrubs the owner's identity and campaign from any URLs they created — the shortened URLs themselves continue to work.
 
 ### Validate a key
 
@@ -557,7 +571,7 @@ curl https://yourdomain.com/api/validate \
   -H "Authorization: Bearer YOUR_API_KEY"
 ```
 
-Any valid key. Returns `valid`, `type`, `label`, `created`, `tokenPrefix`, the owner fields and `createdByCampaign` when set, and `services`: for every service, `{ name, consented, accepted, current, version, by, at, privacyUrl }`. Admin keys report `consented`/`accepted`/`current` true and `version`/`by`/`at` null. See [PHP_INTEGRATION.md](PHP_INTEGRATION.md#step-4--check-the-key-and-its-consents) for an example.
+Any valid key. Returns `valid`, `type`, `label`, `created`, `tokenPrefix`, the owner fields and `createdByCampaign` when set, and `services`: for every service, `{ name, consented, accepted, current, version, by, at, privacyUrl }`. Admin keys report `consented`/`accepted`/`current` true and `version`/`by`/`at` null. Tenant keys add `issuedBy` (the provider's label) and `tenant`; provider keys report `type: "provider"` and no `services`. See [PHP_INTEGRATION.md](PHP_INTEGRATION.md#step-4--check-the-key-and-its-consents) for an example.
 
 ### Authorize a key for a service
 
@@ -597,7 +611,38 @@ curl -X PUT https://yourdomain.com/api/keys/{id}/consents/sms-shortener \
   -d '{"by": "admin@example.org"}'
 ```
 
-Requires admin key. Records a consent given outside the sign-in flow (e.g. in writing); `by` says who agreed, `version` (`YYYY-MM-DD`, optional) defaults to the service's current `policyVersion`, and `byOwner` records the admin key used. 200 `{"id", "service", "consent"}`; 404 for an unknown key. The tests use it to give consents.
+Requires admin key. Records a consent given outside the sign-in flow (e.g. in writing); `by` says who agreed, `version` (`YYYY-MM-DD`, optional) defaults to the service's current `policyVersion`, and `byOwner` records the admin key used. 200 `{"id", "service", "consent"}`; 404 for an unknown key; 400 for a provider key. The tests use it to give consents.
+
+### Tenants (provider keys)
+
+All `/api/tenants` endpoints take a provider key: 401 for a bad key, 403 `{"error": "provider_key_required"}` for any other key type. `{tenant}` is the tenant id, URL-encoded.
+
+```bash
+# Issue (or rotate) a tenant's key
+curl -X POST https://yourdomain.com/api/tenants \
+  -H "Authorization: Bearer PROVIDER_KEY" -H "Content-Type: application/json" \
+  -d '{"tenant": "site-42.host.example", "name": "Example Parish"}'
+# → 201 {"token": "cus_...", "id": "...", "tenant": "site-42.host.example", "replaced": false}
+
+# Record the tenant's consent, on its sysadmin's word
+curl -X PUT https://yourdomain.com/api/tenants/site-42.host.example/consents/sms-shortener \
+  -H "Authorization: Bearer PROVIDER_KEY" -H "Content-Type: application/json" \
+  -d '{"agree": true, "by": {"name": "Example Sysadmin", "email": "sysadmin@example.org"}}'
+# → 200 {"service": "sms-shortener", "consent": {"version", "by", "byName", "byOwner", "vouchedBy", "at"}}
+
+# Withdraw it (idempotent) → 200 {"withdrawn": true, "service": "sms-shortener"}
+curl -X DELETE https://yourdomain.com/api/tenants/site-42.host.example/consents/sms-shortener -H "Authorization: Bearer PROVIDER_KEY"
+
+# List the provider's tenants → [{"tenant", "name", "keyId", "tokenPrefix", "created", "consents"}]
+curl https://yourdomain.com/api/tenants -H "Authorization: Bearer PROVIDER_KEY"
+
+# Revoke a tenant's key, as its own DELETE /api/keys/mine would → 200 {"revoked": true, "tenant": "..."}
+curl -X DELETE https://yourdomain.com/api/tenants/site-42.host.example -H "Authorization: Bearer PROVIDER_KEY"
+```
+
+- `POST /api/tenants`: `tenant` is 1–200 characters of `[A-Za-z0-9._:-]`, `name` 1–100 characters; 400 otherwise. A tenant that already has a key gets a new one (`replaced: true`), its old key revoked and its consents carried over.
+- `PUT …/consents/{service}`: 400 for an unknown service, `agree` other than `true`, or a missing/invalid `by.email` (≤254 characters) or `by.name` over 100 characters; 404 for a tenant this provider has not issued a key to.
+- `DELETE /api/tenants/{tenant}`: 404 for an unknown tenant. The tenant key can still withdraw its own consents with `DELETE /api/consents/{service}` and revoke itself with `DELETE /api/keys/mine`.
 
 ## Caching
 

@@ -453,6 +453,182 @@ async function runTests() {
     if (ck) await fetch(`${BASE_URL}/api/keys/${ck.id}`, { method: 'DELETE', headers });
   }
 
+  // Hosting providers
+  console.log('\n🏢 Hosting providers');
+  const api = (path, { method = 'GET', token = API_KEY, body } = {}) => fetch(`${BASE_URL}${path}`, {
+    method, headers: bearer(token), ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+  const mkKey = async (body) => {
+    const resp = await api('/api/keys', { method: 'POST', body });
+    assert(resp.status === 201, `POST /api/keys ${JSON.stringify(body)}: ${resp.status}`);
+    return resp.json();
+  };
+  const tenantPath = (t) => `/api/tenants/${encodeURIComponent(t)}`;
+  const T1 = `host.example:${Date.now()}`;
+  const T2 = `${T1}-two`;
+  let pv = null; // provider key { id, token }
+  let pv2 = null; // a second provider
+  let plain = null; // an ordinary create key
+  let t1 = null; // T1's current key { id, token }
+  const pcode = `${testCode}-tenant`;
+
+  try {
+    await test('POST /api/keys creates a provider key (label required)', async () => {
+      assert((await api('/api/keys', { method: 'POST', body: { type: 'provider' } })).status === 400, 'no label');
+      pv = await mkKey({ type: 'provider', label: 'Example Hosting' });
+      assert(pv.type === 'provider' && pv.token.startsWith('cus_'), JSON.stringify(pv));
+      pv2 = await mkKey({ type: 'provider', label: 'Other Hosting' });
+      plain = await mkKey({ type: 'create', label: 'not a provider' });
+    });
+
+    await test('a provider key cannot use services or consent for itself', async () => {
+      for (const resp of [
+        await api('/api/authorize?service=sms-shortener', { token: pv.token }),
+        await api('/api/shorten', { method: 'POST', token: pv.token, body: { url: 'https://example.com/provider' } }),
+        await api('/api/consents', { method: 'POST', token: pv.token, body: { service: 'sms-shortener' } }),
+      ]) {
+        assert(resp.status === 403, `Expected 403, got ${resp.status}`);
+        assert((await resp.json()).error === 'provider_key', 'provider_key');
+      }
+    });
+
+    await test('GET /api/validate for a provider key: type provider, no services', async () => {
+      const data = await (await api('/api/validate', { token: pv.token })).json();
+      assert(data.type === 'provider' && data.label === 'Example Hosting' && !('services' in data), JSON.stringify(data));
+    });
+
+    await test('/api/tenants refuses non-provider keys (403 provider_key_required) and bad keys (401)', async () => {
+      for (const token of [API_KEY, plain.token]) {
+        const resp = await api('/api/tenants', { method: 'POST', token, body: { tenant: T1, name: 'X' } });
+        assert(resp.status === 403 && (await resp.json()).error === 'provider_key_required', `token ${token.slice(0, 6)}`);
+      }
+      assert((await api('/api/tenants', { token: plain.token })).status === 403, 'GET with a create key');
+      assert((await api('/api/tenants', { token: 'cus_bad' })).status === 401, 'bad key');
+    });
+
+    await test('POST /api/tenants rejects bad input', async () => {
+      for (const body of [
+        { tenant: 'has space', name: 'X' }, { tenant: 'x'.repeat(201), name: 'X' }, { tenant: '', name: 'X' },
+        { tenant: T1 }, { tenant: T1, name: 'x'.repeat(101) },
+      ]) {
+        const resp = await api('/api/tenants', { method: 'POST', token: pv.token, body });
+        assert(resp.status === 400, `${JSON.stringify(body).slice(0, 40)}: ${resp.status}`);
+      }
+    });
+
+    await test('POST /api/tenants mints a tenant key; validate shows issuedBy and tenant', async () => {
+      const resp = await api('/api/tenants', { method: 'POST', token: pv.token, body: { tenant: T1, name: 'Example Parish' } });
+      assert(resp.status === 201, `Expected 201, got ${resp.status}`);
+      t1 = await resp.json();
+      assert(t1.token.startsWith('cus_') && t1.id && t1.tenant === T1 && t1.replaced === false, JSON.stringify(t1));
+      const data = await (await api('/api/validate', { token: t1.token })).json();
+      assert(data.type === 'create' && data.issuedBy === 'Example Hosting' && data.tenant === T1, JSON.stringify(data));
+      assert(data.createdByCampaign === 'Example Parish' && !('ownerEmail' in data) && !('provider' in data), 'tenant fields');
+      assert(data.services['sms-shortener'].consented === false, 'no consents yet');
+      const auth = await api('/api/authorize?service=sms-shortener', { token: t1.token });
+      assert(auth.status === 403 && (await auth.json()).error === 'consent_required', 'consent required');
+    });
+
+    await test('PUT /api/tenants/{tenant}/consents/{service} checks its input', async () => {
+      const put = (body, { tenant = T1, service = 'sms-shortener', token = pv.token } = {}) =>
+        api(`${tenantPath(tenant)}/consents/${service}`, { method: 'PUT', token, body });
+      const by = { name: 'Example Sysadmin', email: 'sysadmin@example.org' };
+      assert((await put({ agree: false, by })).status === 400, 'agree false');
+      assert((await put({ agree: 'yes', by })).status === 400, 'agree not true');
+      assert((await put({ agree: true, by: { name: 'Example Sysadmin' } })).status === 400, 'no email');
+      assert((await put({ agree: true, by: { email: 'not-an-email' } })).status === 400, 'bad email');
+      assert((await put({ agree: true, by: { ...by, name: 'x'.repeat(101) } })).status === 400, 'long name');
+      assert((await put({ agree: true, by }, { service: 'nope' })).status === 400, 'unknown service');
+      assert((await put({ agree: true, by }, { tenant: `${T1}-none` })).status === 404, 'unknown tenant');
+      assert((await put({ agree: true, by }, { token: pv2.token })).status === 404, "another provider's tenant");
+      assert((await put({ agree: true, by }, { token: plain.token })).status === 403, 'create key');
+    });
+
+    await test('a vouched consent lets the tenant key use the service (authorize and shorten 200)', async () => {
+      for (const service of ['sms-shortener', 'url-shortener']) {
+        const resp = await api(`${tenantPath(T1)}/consents/${service}`, {
+          method: 'PUT', token: pv.token, body: { agree: true, by: { name: 'Example Sysadmin', email: 'sysadmin@example.org' } },
+        });
+        assert(resp.status === 200, `PUT ${service}: ${resp.status}`);
+        const { service: s, consent } = await resp.json();
+        assert(s === service && consent.version === SERVICES[service].policyVersion, JSON.stringify(consent));
+        assert(consent.by === 'sysadmin@example.org' && consent.byName === 'Example Sysadmin', 'by');
+        assert(consent.byOwner === `vouched:${pv.id}` && consent.vouchedBy === 'Example Hosting' && consent.at, 'vouched');
+      }
+      const auth = await api('/api/authorize?service=sms-shortener', { token: t1.token });
+      assert(auth.status === 200, `authorize: ${auth.status}`);
+      assert((await auth.json()).keyId === t1.id, 'keyId is the tenant key');
+      const short = await api('/api/shorten', { method: 'POST', token: t1.token, body: { url: 'https://example.com/tenant', code: pcode } });
+      assert(short.status === 200, `shorten: ${short.status}`);
+      const s = (await (await api('/api/validate', { token: t1.token })).json()).services['sms-shortener'];
+      assert(s.consented && s.accepted && s.current && s.by === 'sysadmin@example.org', JSON.stringify(s));
+    });
+
+    await test('POST /api/tenants again rotates the key, carrying its consents over', async () => {
+      const resp = await api('/api/tenants', { method: 'POST', token: pv.token, body: { tenant: T1, name: 'Example Parish' } });
+      assert(resp.status === 201, `Expected 201, got ${resp.status}`);
+      const next = await resp.json();
+      assert(next.replaced === true && next.id !== t1.id, JSON.stringify(next));
+      assert((await api('/api/validate', { token: t1.token })).status === 401, 'old key revoked');
+      t1 = next;
+      assert((await api('/api/authorize?service=sms-shortener', { token: t1.token })).status === 200, 'consent carried over');
+    });
+
+    await test('consents are withdrawn by the provider (idempotently) or by the tenant key itself', async () => {
+      for (let i = 0; i < 2; i++) {
+        const resp = await api(`${tenantPath(T1)}/consents/sms-shortener`, { method: 'DELETE', token: pv.token });
+        assert(resp.status === 200, `DELETE: ${resp.status}`);
+        const data = await resp.json();
+        assert(data.withdrawn === true && data.service === 'sms-shortener', JSON.stringify(data));
+      }
+      const auth = await api('/api/authorize?service=sms-shortener', { token: t1.token });
+      assert(auth.status === 403 && (await auth.json()).error === 'consent_required', 'refused after withdrawal');
+      assert((await api('/api/consents/url-shortener', { method: 'DELETE', token: t1.token })).status === 200, 'tenant withdraws');
+      const short = await api('/api/shorten', { method: 'POST', token: t1.token, body: { url: 'https://example.com/tenant-2' } });
+      assert(short.status === 403, `shorten after withdrawal: ${short.status}`);
+    });
+
+    await test('GET /api/tenants lists only this provider\'s tenants', async () => {
+      assert((await api('/api/tenants', { method: 'POST', token: pv.token, body: { tenant: T2, name: 'Second Parish' } })).status === 201, 'mint T2');
+      const resp = await api('/api/tenants', { token: pv.token });
+      assert(resp.status === 200, `Expected 200, got ${resp.status}`);
+      const list = await resp.json();
+      const one = list.find((t) => t.tenant === T1);
+      assert(one && one.name === 'Example Parish' && one.keyId === t1.id && one.tokenPrefix && one.created, JSON.stringify(one));
+      assert(typeof one.consents === 'object' && !one.consents['sms-shortener'], 'consents');
+      assert(list.some((t) => t.tenant === T2 && t.name === 'Second Parish'), 'T2 listed');
+      assert((await (await api('/api/tenants', { token: pv2.token })).json()).length === 0, 'other provider sees none');
+    });
+
+    await test('DELETE /api/tenants/{tenant} revokes the key, scrubs attribution and removes the index', async () => {
+      const before = (await (await api('/api/urls')).json()).urls.find((u) => u.code === pcode);
+      assert(before?.createdBy === `tenant:${pv.id}:${T1}` && before.createdByCampaign === 'Example Parish', JSON.stringify(before));
+      const resp = await api(tenantPath(T1), { method: 'DELETE', token: pv.token });
+      assert(resp.status === 200, `Expected 200, got ${resp.status}`);
+      const data = await resp.json();
+      assert(data.revoked === true && data.tenant === T1, JSON.stringify(data));
+      assert((await api('/api/validate', { token: t1.token })).status === 401, 'key revoked');
+      const after = (await (await api('/api/urls')).json()).urls.find((u) => u.code === pcode);
+      assert(after && !after.createdBy && !after.createdByCampaign, JSON.stringify(after));
+      assert(!(await (await api('/api/tenants', { token: pv.token })).json()).some((t) => t.tenant === T1), 'unlisted');
+      assert((await api(tenantPath(T1), { method: 'DELETE', token: pv.token })).status === 404, 'second delete');
+    });
+
+    await test("a tenant key's DELETE /api/keys/mine also removes its tenant index entry", async () => {
+      const minted = await (await api('/api/tenants', { method: 'POST', token: pv.token, body: { tenant: T2, name: 'Second Parish' } })).json();
+      assert((await api('/api/keys/mine', { method: 'DELETE', token: minted.token })).status === 200, 'deregistered');
+      assert(!(await (await api('/api/tenants', { token: pv.token })).json()).some((t) => t.tenant === T2), 'unlisted');
+      const put = await api(`${tenantPath(T2)}/consents/sms-shortener`, {
+        method: 'PUT', token: pv.token, body: { agree: true, by: { email: 'sysadmin@example.org' } },
+      });
+      assert(put.status === 404, `vouching for a deregistered tenant: ${put.status}`);
+    });
+  } finally {
+    await api(`/api/urls/${pcode}`, { method: 'DELETE' });
+    await api(`/api/urls/${pcode}/permanent`, { method: 'DELETE' });
+    for (const k of [pv, pv2, plain]) if (k) await api(`/api/keys/${k.id}`, { method: 'DELETE' });
+  }
+
   console.log('\n📄 Pages');
   await test('GET /url-shortener/privacy is dated by the url-shortener policyVersion', async () => {
     const resp = await fetch(`${BASE_URL}/url-shortener/privacy`);

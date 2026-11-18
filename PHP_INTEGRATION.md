@@ -250,6 +250,43 @@ $predicted = $s->previewShorten('https://example.com/test', campaign: 'integrati
 
 Requires `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` on the worker (see README step 6). Without them the API returns 501 for `"block_bots": true`.
 
+## Hosting providers
+
+A hosting provider running many Jethro installations (tenants) can register them without anyone signing in at jethro.au. The jethro.au operator issues the provider one **provider key** (`POST /api/keys` with `{"type": "provider", "label": "<provider name>"}`). The provider's own systems hold it — never a tenant's `conf.php` — and use it to:
+
+1. **Issue each tenant its key.** The tenant's key is an ordinary create key; save it to that tenant's `JETHROAU_API_KEY` (Step 3). `tenant` is a stable id of the provider's choosing (1–200 characters of `[A-Za-z0-9._:-]`), `name` the organisation's name (≤100 characters), which is shown on consent pages and stamped on its short URLs.
+
+   ```bash
+   curl -X POST https://jethro.au/api/tenants \
+     -H "Authorization: Bearer $PROVIDER_KEY" -H "Content-Type: application/json" \
+     -d '{"tenant": "site-42.host.example", "name": "Example Parish"}'
+   # → 201 {"token": "cus_...", "id": "...", "tenant": "site-42.host.example", "replaced": false}
+   ```
+
+   Calling it again for the same tenant rotates the key: the old one is revoked, its consents carry over, and `replaced` is `true`.
+
+2. **Record the tenant's agreement to a service**, when the tenant's sysadmin — signed in to the provider's Jethro hosting, so already authenticated — ticks "I agree" on the tenant's behalf. Show them the service's acknowledgement and privacy page first (the validate `services` map has each `privacyUrl`):
+
+   ```bash
+   curl -X PUT https://jethro.au/api/tenants/site-42.host.example/consents/sms-shortener \
+     -H "Authorization: Bearer $PROVIDER_KEY" -H "Content-Type: application/json" \
+     -d '{"agree": true, "by": {"name": "Example Sysadmin", "email": "sysadmin@example.org"}}'
+   # → 200 {"service": "sms-shortener", "consent": {"version": "2026-11-18", "by": "sysadmin@example.org",
+   #         "byName": "Example Sysadmin", "byOwner": "vouched:<providerKeyId>", "vouchedBy": "<provider name>", "at": "..."}}
+   ```
+
+   `agree` must be `true` and `by.email` a valid address. jethro.au records the consent on the tenant's key as vouched for by the provider; the tenant's key then passes `/api/authorize` and `/api/shorten` for that service, and `GET /api/validate` with the tenant's key shows it (plus `issuedBy`, the provider's name, and `tenant`).
+
+3. **Turn a service off** with `DELETE /api/tenants/{tenant}/consents/{service}` (idempotent, 200 `{"withdrawn": true, "service"}`). The tenant's own key can also call `DELETE /api/consents/{service}`.
+
+4. **List its tenants** with `GET /api/tenants` → `[{"tenant", "name", "keyId", "tokenPrefix", "created", "consents"}]`.
+
+5. **Revoke a tenant's key** with `DELETE /api/tenants/{tenant}` → 200 `{"revoked": true, "tenant"}`. This is exactly what the tenant's own `DELETE /api/keys/mine` (Deregister) does, including removing the tenant's identity and organisation name from its short URLs.
+
+`{tenant}` in paths is the URL-encoded tenant id (`rawurlencode()` in PHP). Errors: 401 for a bad key; 403 `{"error": "provider_key_required"}` when a non-provider key calls `/api/tenants`; 400 for bad input or an unknown service; 404 for a tenant the provider has not issued a key to. The provider key itself cannot shorten URLs, call services or hold consents (403 `{"error": "provider_key"}`).
+
+Self-service keys (from `/signup`) cannot be vouched for: their consents always come from a person signing in at jethro.au (Steps 1 and 5).
+
 ## Reference
 
 ### JethroAuUrlShortener signup methods
